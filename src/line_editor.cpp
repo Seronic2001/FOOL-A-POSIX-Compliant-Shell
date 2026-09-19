@@ -236,6 +236,9 @@ std::string read_command_line() {
         return "";
       }
       // Non-empty line: EOF does nothing (bash behavior).
+    } else if (c == 12) {  // Ctrl+L (clear screen)
+      std::cout << "\x1b[H\x1b[2J\x1b[3J" << std::flush;
+      redraw_line();
     } else if (c == '\x1b') {
       char seq[2];
       if (!read_byte(seq[0])) continue;

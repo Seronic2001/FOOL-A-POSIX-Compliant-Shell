@@ -372,7 +372,7 @@ int execute_ls(const std::vector<std::string>& args, std::ostream& out) {
 
 int execute_clear(const std::vector<std::string>& args, std::ostream& out) {
   (void)args;
-  out << "\x1b[H\x1b[2J" << std::flush;
+  out << "\x1b[H\x1b[2J\x1b[3J" << std::flush;
   return 0;
 }
 

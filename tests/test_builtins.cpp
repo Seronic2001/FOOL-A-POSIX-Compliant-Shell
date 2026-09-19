@@ -177,4 +177,13 @@ TEST(pwd, prints_current_directory) {
   CHECK(out.str()[0] == '/');
 }
 
+// ---------------- clear ----------------
+
+TEST(clear, clears_screen_and_scrollback) {
+  std::ostringstream out;
+  int rc = execute_clear({"clear"}, out);
+  CHECK_EQ(rc, 0);
+  CHECK_STR_EQ(out.str(), "\x1b[H\x1b[2J\x1b[3J");
+}
+
 int main() { return testfw::run_all_tests(); }
