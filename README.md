@@ -95,19 +95,19 @@ Beyond the core requirements, this shell implements several quality-of-life impr
 
 ## Code Structure
 
-The project is organized into several modular files, each with a specific responsibility:
+The project is organized into several modular files, each with a specific responsibility. All sources live in `src/`:
 
-  * **`main.cpp`**: The entry point of the shell. It contains the main loop, initializes history and autocomplete caches, and sets up signal handlers.
-  * **`parser.cpp`**: Responsible for tokenizing the raw input string into a structured sequence of commands, handling quotes, semicolons, pipes, and redirection.
-  * **`executor.cpp`**: The execution engine. It takes parsed commands and manages forking, piping, I/O redirection, and running both built-in and system commands.
-  * **`builtins.cpp`**: Contains the implementation for all built-in commands like `cd`, `ls`, `pinfo`, `history`, etc.
-  * **`line_editor.cpp`**: Manages the interactive command-line interface. It enables raw terminal mode to handle keypresses for history navigation, tab completion, and signal shortcuts.
-  * **`autocomplete.cpp`**: Implements the logic for tab completion for both system commands and local files/directories.
-  * **`history.cpp`**: Manages the command history, including loading from and saving to a file to ensure persistence across sessions.
-  * **`prompt.cpp`**: Contains the logic for generating and displaying the dynamic shell prompt.
-  * **`shell_signals.cpp`**: Implements the signal handlers. SIGCHLD uses the self-pipe trick: the handler is async-signal-safe (a single `write()` of a wake byte) and all reaping happens on the main thread, so child statuses are never lost or double-reaped.
-  * **`colors.h`**: A utility header defining ANSI color codes for styled output.
-  * **`tests/`**: The test suite (unit, batch integration, and interactive pty tests) \u2014 see [Testing](#testing).
+  * **`src/main.cpp`**: The entry point of the shell. It contains the main loop, initializes history and autocomplete caches, and sets up signal handlers.
+  * **`src/parser.cpp`**: Responsible for tokenizing the raw input string into a structured sequence of commands, handling quotes, semicolons, pipes, and redirection.
+  * **`src/executor.cpp`**: The execution engine. It takes parsed commands and manages forking, piping, I/O redirection, and running both built-in and system commands.
+  * **`src/builtins.cpp`**: Contains the implementation for all built-in commands like `cd`, `ls`, `pinfo`, `history`, etc.
+  * **`src/line_editor.cpp`**: Manages the interactive command-line interface. It enables raw terminal mode to handle keypresses for history navigation, tab completion, and signal shortcuts.
+  * **`src/autocomplete.cpp`**: Implements the logic for tab completion for both system commands and local files/directories.
+  * **`src/history.cpp`**: Manages the command history, including loading from and saving to a file to ensure persistence across sessions.
+  * **`src/prompt.cpp`**: Contains the logic for generating and displaying the dynamic shell prompt.
+  * **`src/shell_signals.cpp`**: Implements the signal handlers. SIGCHLD uses the self-pipe trick: the handler is async-signal-safe (a single `write()` of a wake byte) and all reaping happens on the main thread, so child statuses are never lost or double-reaped.
+  * **`src/colors.h`**: A utility header defining ANSI color codes for styled output.
+  * **`tests/`**: The test suite (unit, batch integration, and interactive pty tests) — see [Testing](#testing).
 
 -----
 
@@ -161,7 +161,7 @@ bash tests/run_tests.sh
 
 The integration/interactive suites require `python3` (standard library
 only; no pip packages needed). The interactive suite needs a Unix-like
-system with pty support and will skip nothing \u2014 it runs real keypresses
+system with pty support and will skip nothing — it runs real keypresses
 against a real terminal.
 
 -----
