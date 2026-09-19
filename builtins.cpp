@@ -1,15 +1,24 @@
 #include <dirent.h>
+#include <fcntl.h>
+#include <glob.h>
 #include <grp.h>
 #include <limits.h>
 #include <pwd.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -19,110 +28,117 @@
 #include "executor.h"
 #include "history.h"
 
-// static variables for built-ins (like for 'cd -') ---
-static std::string previous_dir = "";
 extern std::string shell_home_dir;
 
-// change directory command
+// ---------------- cd ----------------
+
 void execute_cd(const std::vector<std::string>& args, std::ostream& out) {
   if (args.size() > 2) {
     out << "cd : too many arguments \n";
     return;
   }
 
+  static std::string previous_dir;  // Shell state, must live in the parent.
+
   std::string target_path;
 
   if (args.size() == 1 || args[1] == "~") {
-    // Case 1: "cd" (no arguments) or cd ~ -> go to SYSTEM HOME
     const char* home_dir = getenv("HOME");
-    if (home_dir == nullptr) {
-      out << "cd: HOME not set" << std::endl;
+    if (home_dir == nullptr || home_dir[0] == '\0') {
+      std::cerr << "cd: HOME not set" << std::endl;
       return;
     }
     target_path = home_dir;
   } else if (args[1] == "-") {
-    // Case 3: "cd -" -> go to previous directory
     if (previous_dir.empty()) {
-      out << "cd: OLDPWD not set" << std::endl;
+      std::cerr << "cd: OLDPWD not set" << std::endl;
       return;
     }
     target_path = previous_dir;
-    // Mimic shell behavior by printing the path
     out << target_path << std::endl;
   } else {
-    // Case 4: "cd .", "cd ..", "cd /path/to/dir"
     target_path = args[1];
   }
 
+  // Resolve ~ at the start of the target (cd ~/docs).
+  if (target_path.size() >= 2 && target_path[0] == '~' &&
+      (target_path[1] == '/' || target_path.size() == 2)) {
+    const char* home_dir = getenv("HOME");
+    if (home_dir != nullptr) {
+      target_path = std::string(home_dir) + target_path.substr(1);
+    }
+  }
+
   char cwd_buffer[PATH_MAX];
-  if (getcwd(cwd_buffer, PATH_MAX) == nullptr) {
+  if (getcwd(cwd_buffer, sizeof(cwd_buffer)) == nullptr) {
     perror("cd: error getting current directory");
     return;
   }
 
-  // Execute the directory change
   if (chdir(target_path.c_str()) != 0) {
     perror(("cd: " + target_path).c_str());
   } else {
-    // On successful change, update the previous directory
+    // Only remember the previous directory on success.
     previous_dir = cwd_buffer;
   }
 }
 
-// print working directory command
-void execute_pwd(const std::vector<std::string>& args, std::ostream& out) {
-  // The 'pwd' command typically ignores extra arguments.
-  char cwd_buffer[PATH_MAX];
+// ---------------- pwd ----------------
 
+int execute_pwd(const std::vector<std::string>& args, std::ostream& out) {
+  (void)args;
+  char cwd_buffer[PATH_MAX];
   if (getcwd(cwd_buffer, sizeof(cwd_buffer)) != nullptr) {
-    // On success, print the path followed by a newline.
     out << cwd_buffer << "\n";
   } else {
     perror("pwd");
   }
+  return 0;
 }
 
-// echo Command
-void execute_echo(const std::vector<std::string>& args,
-                  std::istream& in,
-                  std::ostream& out) {
-  if (args.size() > 1) {
-    // Case 1: Echo arguments
-    // Loop through the arguments, starting from the second element (index 1)
-    for (size_t i = 1; i < args.size(); i++) {
-      out << args[i];
-      if (i < args.size() - 1) {
-        out << " ";
-      }
-    }
-    out << "\n";
-  } else {
-    // Case 2: No args → just print newline
-    out << "\n";
+// ---------------- echo ----------------
+
+int execute_echo(const std::vector<std::string>& args,
+                 std::istream& in,
+                 std::ostream& out) {
+  (void)in;
+  bool suppress_newline = false;
+  size_t first_arg = 1;
+
+  if (args.size() > 1 && args[1] == "-n") {
+    suppress_newline = true;
+    first_arg = 2;
   }
+
+  for (size_t i = first_arg; i < args.size(); i++) {
+    out << args[i];
+    if (i < args.size() - 1) {
+      out << " ";
+    }
+  }
+  if (!suppress_newline) out << "\n";
+  return 0;
 }
 
-// helpers for ls command
+// ---------------- ls helpers ----------------
+
 std::string human_readable_size(off_t size) {
   const char* suffixes[] = {"B", "K", "M", "G", "T"};
   int suffix_index = 0;
-  double formatted_size = size;
+  double formatted_size = (double)size;
 
-  // Keep dividing by 1024 until the size is less than 1024
   while (formatted_size >= 1024 && suffix_index < 4) {
     formatted_size /= 1024.0;
     suffix_index++;
   }
 
   std::stringstream ss;
-  // Format to one decimal place, unless it's just bytes
   if (suffix_index > 0) {
     ss << std::fixed << std::setprecision(1) << formatted_size
        << suffixes[suffix_index];
   } else {
     ss << formatted_size << suffixes[suffix_index];
   }
-
   return ss.str();
 }
 
@@ -130,29 +146,59 @@ void print_colored_name(const struct stat& file_stat,
                         const std::string& name,
                         std::ostream& out) {
   if (S_ISDIR(file_stat.st_mode)) {
-    // It's a directory -> print in bold blue
     out << BOLD_BLUE << name << RESET;
   } else if (S_ISREG(file_stat.st_mode) &&
              (file_stat.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
-    // It's a regular file with execute permissions -> print in bold green
     out << BOLD_GREEN << name << RESET;
+  } else if (S_ISLNK(file_stat.st_mode)) {
+    out << BOLD_CYAN << name << RESET;
   } else {
-    // It's a regular file or something else -> print normally
     out << name;
   }
+}
+
+// Safe wrappers: getpwuid/getgrgid return NULL for unknown ids.
+static std::string user_name(uid_t uid) {
+  struct passwd* pw = getpwuid(uid);
+  if (pw != nullptr && pw->pw_name != nullptr) return pw->pw_name;
+  return std::to_string(uid);
+}
+
+static std::string group_name(gid_t gid) {
+  struct group* gr = getgrgid(gid);
+  if (gr != nullptr && gr->gr_name != nullptr) return gr->gr_name;
+  return std::to_string(gid);
+}
+
+static char type_letter(mode_t mode) {
+  if (S_ISDIR(mode)) return 'd';
+  if (S_ISLNK(mode)) return 'l';
+  if (S_ISCHR(mode)) return 'c';
+  if (S_ISBLK(mode)) return 'b';
+  if (S_ISFIFO(mode)) return 'p';
+  if (S_ISSOCK(mode)) return 's';
+  return '-';
+}
+
+// The basename of a path, used to display entries in long listings.
+static std::string name_of_path(const std::string& path) {
+  size_t slash = path.find_last_of('/');
+  if (slash == std::string::npos) return path;
+  if (slash + 1 >= path.size()) return path;
+  return path.substr(slash + 1);
 }
 
 void print_long_format(const std::string& path,
                        bool human_readable,
                        std::ostream& out) {
   struct stat file_stat;
-  if (stat(path.c_str(), &file_stat) == -1) {
-    perror(("stat: " + path).c_str());
+  // lstat: report the link itself for symlinks (like ls does).
+  if (lstat(path.c_str(), &file_stat) == -1) {
+    perror(("ls: " + path).c_str());
     return;
   }
 
-  // Print Permissions
-  out << ((S_ISDIR(file_stat.st_mode)) ? "d" : "-");
+  out << type_letter(file_stat.st_mode);
   out << ((file_stat.st_mode & S_IRUSR) ? "r" : "-");
   out << ((file_stat.st_mode & S_IWUSR) ? "w" : "-");
   out << ((file_stat.st_mode & S_IXUSR) ? "x" : "-");
@@ -163,10 +209,9 @@ void print_long_format(const std::string& path,
   out << ((file_stat.st_mode & S_IWOTH) ? "w" : "-");
   out << ((file_stat.st_mode & S_IXOTH) ? "x" : "-");
 
-  // Print Link Count, Owner, Group, Size
   out << " " << file_stat.st_nlink;
-  out << " " << getpwuid(file_stat.st_uid)->pw_name;
-  out << " " << getgrgid(file_stat.st_gid)->gr_name;
+  out << " " << user_name(file_stat.st_uid);
+  out << " " << group_name(file_stat.st_gid);
 
   if (human_readable) {
     out << " " << std::setw(6) << human_readable_size(file_stat.st_size);
@@ -174,14 +219,29 @@ void print_long_format(const std::string& path,
     out << " " << std::setw(6) << file_stat.st_size;
   }
 
-  // Print Timestamp
+  // ls convention: files newer than ~6 months show the time, older ones the
+  // year instead.
+  time_t now = time(nullptr);
+  const char* fmt =
+      (now - file_stat.st_mtime > 6 * 30 * 24 * 3600) ? "%b %d  %Y"
+                                                      : "%b %d %H:%M";
   char time_buf[80];
-  strftime(time_buf, sizeof(time_buf), "%b %d %H:%M",
-           localtime(&file_stat.st_mtime));
-  out << " " << time_buf << "  ";
+  strftime(time_buf, sizeof(time_buf), fmt, localtime(&file_stat.st_mtime));
+  out << " " << time_buf << " ";
+
+  // Show symlink targets like real ls.
+  if (S_ISLNK(file_stat.st_mode)) {
+    char target[PATH_MAX];
+    ssize_t len = readlink(path.c_str(), target, sizeof(target) - 1);
+    if (len >= 0) {
+      target[len] = '\0';
+      out << name_of_path(path) << " -> " << target;
+      return;
+    }
+  }
+  out << name_of_path(path);
 }
 
-// A helper struct to hold file info
 struct DirectoryEntry {
   std::string name;
   struct stat stat_info;
@@ -194,311 +254,310 @@ void list_directory(const std::string& path,
                     std::ostream& out) {
   DIR* dir = opendir(path.c_str());
   if (dir == nullptr) {
-    perror(("ls: cannot access '" + path + "'").c_str());
+    perror(("ls: cannot open '" + path + "'").c_str());
     return;
   }
+  std::unique_ptr<DIR, int (*)(DIR*)> dir_guard(dir, closedir);
 
   std::vector<DirectoryEntry> entries;
   long total_blocks = 0;
 
-  // Read all entries into a vector
   struct dirent* entry;
   while ((entry = readdir(dir)) != nullptr) {
-    if (!show_all && entry->d_name[0] == '.') {
-      continue;
-    }
+    if (!show_all && entry->d_name[0] == '.') continue;
 
     DirectoryEntry current_entry;
     current_entry.name = entry->d_name;
 
     std::string full_path = path + "/" + current_entry.name;
-    if (stat(full_path.c_str(), &current_entry.stat_info) == 0) {
+    // lstat so symlinks are listed as themselves; a broken symlink is still
+    // listed instead of silently vanishing.
+    if (lstat(full_path.c_str(), &current_entry.stat_info) == 0) {
       entries.push_back(current_entry);
       total_blocks += current_entry.stat_info.st_blocks;
     }
   }
-  closedir(dir);
 
-  // Sort the vector alphabetically
   std::sort(entries.begin(), entries.end(),
             [](const DirectoryEntry& a, const DirectoryEntry& b) {
               return a.name < b.name;
             });
 
   if (long_format) {
-    // Print the total block count, converted to kilobytes
     out << "total " << total_blocks / 2 << "\n";
   }
 
   for (const auto& ent : entries) {
     if (long_format) {
+      // print_long_format does not emit a trailing newline.
       print_long_format(path + "/" + ent.name, human_readable, out);
+    } else {
+      print_colored_name(ent.stat_info, ent.name, out);
     }
-    print_colored_name(ent.stat_info, ent.name, out);
     out << "\n";
   }
 }
 
-// ls command
-void execute_ls(const std::vector<std::string>& args, std::ostream& out) {
+int execute_ls(const std::vector<std::string>& args, std::ostream& out) {
   bool show_all = false;
   bool human_readable = false;
   bool long_format = false;
-  std::vector<std::string> file_paths;
-  std::vector<std::string> dir_paths;
+  std::vector<std::string> operands;  // Files and directories, in order.
 
-  // parsing to find the flags and paths
   for (size_t i = 1; i < args.size(); i++) {
-    if (args[i][0] == '-') {
-      // its a flag
-      for (char flag : args[i].substr(1)) {
+    const std::string& arg = args[i];
+    if (arg.size() > 1 && arg[0] == '-' && arg != "--") {
+      for (char flag : arg.substr(1)) {
         if (flag == 'l') {
           long_format = true;
         } else if (flag == 'a') {
           show_all = true;
         } else if (flag == 'h') {
           human_readable = true;
-        }
-      }
-    } else {
-      // It's a path, now let's check its type
-      struct stat path_stat;
-      if (stat(args[i].c_str(), &path_stat) == 0) {
-        if (S_ISDIR(path_stat.st_mode)) {
-          dir_paths.push_back(args[i]);
         } else {
-          file_paths.push_back(args[i]);
+          std::cerr << "ls: invalid option -- '" << flag << "'" << std::endl;
+          return 1;
         }
-      } else {
-        // Handle error: file or directory doesn't exist
-        perror(("ls: cannot access '" + args[i] + "'").c_str());
       }
-    }
-  }
-
-  // Only default to "." if *no* arguments (besides flags) were given
-  bool only_flags = true;
-  for (size_t i = 1; i < args.size(); i++) {
-    if (args[i][0] != '-') {
-      only_flags = false;
+    } else if (arg == "--") {
+      // Everything after -- is an operand, even if it starts with '-'.
+      for (size_t j = i + 1; j < args.size(); j++) operands.push_back(args[j]);
       break;
+    } else {
+      operands.push_back(arg);
     }
   }
 
-  if (only_flags && file_paths.empty() && dir_paths.empty()) {
-    dir_paths.push_back(".");
-  }
+  if (operands.empty()) operands.push_back(".");
 
-  // List all files first
-  for (const auto& path : file_paths) {
+  // Classify operands once, preserving their relative order.
+  std::vector<std::string> files, dirs;
+  for (const auto& op : operands) {
     struct stat path_stat;
-    if (stat(path.c_str(), &path_stat) == 0) {
-      if (long_format) {
-        print_long_format(path, human_readable, out);
-      }
-      print_colored_name(path_stat, path, out);
-      out << "\n";
+    // Use lstat on the operand itself: `ls broken_symlink` must list the
+    // link, and `ls symlink_to_dir` behaves like the directory (stat).
+    if (stat(op.c_str(), &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
+      dirs.push_back(op);
+    } else if (lstat(op.c_str(), &path_stat) == 0) {
+      files.push_back(op);
+    } else {
+      std::cerr << "ls: cannot access '" << op << "': "
+          << std::strerror(errno) << std::endl;
     }
   }
 
-  // Add a newline as we printed files and are about to print directories
-  if (!file_paths.empty() && !dir_paths.empty()) {
+  for (const auto& path : files) {
+    if (long_format) {
+      print_long_format(path, human_readable, out);
+    } else {
+      struct stat st;
+      if (lstat(path.c_str(), &st) == 0) {
+        print_colored_name(st, path, out);
+      }
+    }
     out << "\n";
   }
 
-  // List the contents of all directories next
-  for (size_t i = 0; i < dir_paths.size(); ++i) {
-    // If there's more than one path total, print the directory name
-    if (file_paths.size() + dir_paths.size() > 1) {
-      out << dir_paths[i] << ":" << "\n";
+  if (!files.empty() && !dirs.empty()) out << "\n";
+
+  for (size_t i = 0; i < dirs.size(); ++i) {
+    if (files.size() + dirs.size() > 1) {
+      out << dirs[i] << ":" << "\n";
     }
-    list_directory(dir_paths[i], show_all, long_format, human_readable, out);
-    // Add a newline between directory listings
-    if (i < dir_paths.size() - 1) {
-      out << "\n";
-    }
+    list_directory(dirs[i], show_all, long_format, human_readable, out);
+    if (i < dirs.size() - 1) out << "\n";
   }
+  return 0;
 }
 
-void execute_clear(const std::vector<std::string>& args, std::ostream& out) {
-  // The clear command ignores any arguments.
-  // Write the ANSI escape code to the console.
+int execute_clear(const std::vector<std::string>& args, std::ostream& out) {
+  (void)args;
   out << "\x1b[H\x1b[2J" << std::flush;
+  return 0;
 }
 
-// helper for pinfo command
-void print_process_info(pid_t pid, std::ostream& out) {
-  std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
-  FILE* stat_file = fopen(stat_path.c_str(), "r");
+// ---------------- pinfo ----------------
 
-  if (stat_file == nullptr) {
-    perror(("pinfo: process with pid " + std::to_string(pid) + " not found")
-               .c_str());
+// /proc/<pid>/stat's comm field (2nd) is "(...)" and may contain spaces.
+// Parse defensively: find the closing ')' and scan fields after it.
+static bool parse_proc_stat(pid_t pid, char* state, pid_t* pgrp,
+                            unsigned long* vsize) {
+  std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
+  std::ifstream f(stat_path);
+  if (!f) return false;
+
+  std::string content;
+  std::getline(f, content);
+
+  size_t close_paren = content.rfind(')');
+  if (close_paren == std::string::npos) return false;
+
+  // Fields after comm: state pgrp session ... vsize is field 23 overall.
+  // After ')' the remainder starts at overall field 3 => remainder index 0
+  // is state, index 2 is pgrp (3,4,5 of the line: "state pgrp session").
+  std::istringstream rest(content.substr(close_paren + 1));
+  std::string state_tok, pgrp_tok;
+  if (!(rest >> state_tok)) return false;
+  if (!(rest >> pgrp_tok)) return false;
+
+  // Skip to vsize (overall field 23 => remainder field 21).
+  unsigned long skip;
+  for (int i = 0; i < 17; ++i) {
+    if (!(rest >> skip)) return false;  // fields 6..22 overall
+  }
+  std::string vsize_tok;
+  if (!(rest >> vsize_tok)) return false;
+
+  *state = state_tok[0];
+  *pgrp = (pid_t)std::strtol(pgrp_tok.c_str(), nullptr, 10);
+  *vsize = std::strtoul(vsize_tok.c_str(), nullptr, 10);
+  return true;
+}
+
+void print_process_info(pid_t pid, std::ostream& out) {
+  char state = '?';
+  pid_t pgrp = 0;
+  unsigned long vsize = 0;
+
+  if (!parse_proc_stat(pid, &state, &pgrp, &vsize)) {
+    std::cerr << "pinfo: process with pid " << pid << " not found" << std::endl;
     return;
   }
 
-  char state;           // To hold the process state char (e.g., 'R', 'S', 'Z').
-  int pgrp;             // To hold the process group ID.
-  unsigned long vsize;  // To hold the virtual memory size in bytes.
-
-  fscanf(stat_file,
-         // Format String Breakdown (maps to fields in /proc/[pid]/stat):
-         // '*' after a '%' means discard it.
-         "%*d"                   // Field  1 (pid)
-         " %*s"                  // Field  2 (comm)
-         " %c"                   // Field  3 (state):  STORE it in state.
-         " %*d"                  // Field  4 (ppid)
-         " %d"                   // Field  5 (pgrp):   STORE it in pgrp.
-         " %*d"                  // Field  6 (session)
-         " %*d"                  // Field  7 (tty_nr)
-         " %*d"                  // Field  8 (tpgid)
-         " %*u %*u %*u %*u %*u"  // Fields 9-13
-         " %*u %*u %*u %*u"      // Fields 14-17
-         " %*d %*d %*d %*d"      // Fields 18-21
-         " %*u"                  // Field 22 (starttime)
-         " %lu",                 // Field 23 (vsize): STORE it in vsize.
-         &state, &pgrp, &vsize);
-
-  fclose(stat_file);
-
-  // Get Executable Path from /proc/<pid>/exe
-  std::string exe_path_str = "/proc/" + std::to_string(pid) + "/exe";
-  char exe_path[PATH_MAX] = {0};
-  ssize_t len = readlink(exe_path_str.c_str(), exe_path, sizeof(exe_path) - 1);
-  if (len != -1) {
-    exe_path[len] = '\0';
-  } else {
-    // Error reading link, might be a kernel process or permissions issue
-    strcpy(exe_path, "path not accessible");
+  std::string exe_path = "path not accessible";
+  {
+    std::string exe_link = "/proc/" + std::to_string(pid) + "/exe";
+    std::vector<char> buf(PATH_MAX);
+    ssize_t len = readlink(exe_link.c_str(), buf.data(), buf.size() - 1);
+    if (len >= 0) {
+      buf[len] = '\0';
+      exe_path = buf.data();
+    }
   }
 
-  std::string state_str(1, state);
+  const char* state_name;
   switch (state) {
-    case 'R':
-      state_str = "Running";
-      break;
-    case 'S':
-      state_str = "Sleeping";
-      break;
-    case 'D':
-      state_str = "Disk Sleep";
-      break;
-    case 'Z':
-      state_str = "Zombie";
-      break;
-    case 'T':
-      state_str = "Stopped";
-      break;
-    default:
-      state_str = "Unknown";
-      break;
+    case 'R': state_name = "Running"; break;
+    case 'S': state_name = "Sleeping"; break;
+    case 'D': state_name = "Disk Sleep"; break;
+    case 'Z': state_name = "Zombie"; break;
+    case 'T': state_name = "Stopped"; break;
+    case 'I': state_name = "Idle"; break;
+    default: state_name = "Unknown"; break;
   }
 
-  // Check if it's a foreground process
+  std::string state_str = std::string(1, state) + " {" + state_name + "}";
   pid_t terminal_pgrp = tcgetpgrp(STDIN_FILENO);
-  if (pgrp == terminal_pgrp) {
-    state_str += "+";
-  }
+  if (pgrp == terminal_pgrp) state_str += "+";
 
-  // Print the final output ---
   out << "pid -- " << pid << std::endl;
-  out << "Process Status -- " << state << " {" << state_str << "}" << std::endl;
+  out << "Process Status -- " << state_str << std::endl;
   out << "Memory -- " << vsize / 1024 << " KB {Virtual Memory}" << std::endl;
   out << "Executable Path -- " << exe_path << std::endl;
 }
 
-void execute_pinfo(const std::vector<std::string>& args, std::ostream& out) {
+int execute_pinfo(const std::vector<std::string>& args, std::ostream& out) {
   if (args.size() > 2) {
-    out << "pinfo: too many arguments" << std::endl;
-    return;
+    std::cerr << "pinfo: too many arguments" << std::endl;
+    return 1;
   }
 
   pid_t target_pid;
   if (args.size() == 1) {
-    // Case: "pinfo" -> show info for the shell itself
     target_pid = getpid();
   } else {
-    // Case: "pinfo <pid>" -> show info for specified pid
     try {
-      target_pid = std::stoi(args[1]);
-    } catch (const std::exception& e) {
-      out << "pinfo: invalid pid '" << args[1] << "'" << std::endl;
-      return;
+      size_t pos = 0;
+      long value = std::stol(args[1], &pos);
+      if (pos != args[1].size() || value < 1) throw std::invalid_argument("");
+      target_pid = (pid_t)value;
+    } catch (const std::exception&) {
+      std::cerr << "pinfo: invalid pid '" << args[1] << "'" << std::endl;
+      return 1;
     }
   }
   print_process_info(target_pid, out);
+  return 0;
 }
 
-// Recursive Helper Function for Search
-bool recursive_search(const std::string& dir_path,
-                      const std::string& target_name) {
-  DIR* dir = opendir(dir_path.c_str());
-  if (dir == nullptr) {
-    return false;
-  }
+// ---------------- search ----------------
 
-  struct dirent* entry;
-  while ((entry = readdir(dir)) != nullptr) {
-    std::string name = entry->d_name;
+// Iterative DFS with a visited-(device,inode) set: immune to symlink loops
+// and to directory cycles that a recursive stat()-based walker would chase
+// forever (or stack-overflow on).
+static bool recursive_search(const std::string& root,
+                             const std::string& target_name) {
+  struct Ctx {
+    std::string path;
+  };
 
-    // Case 1: The entry's name matches our target
-    if (name == target_name) {
-      closedir(dir);
-      return true;
+  std::set<std::pair<dev_t, ino_t>> visited;
+  std::vector<Ctx> stack;
+  stack.push_back({root});
+
+  while (!stack.empty()) {
+    Ctx ctx = stack.back();
+    stack.pop_back();
+
+    DIR* dir = opendir(ctx.path.c_str());
+    if (dir == nullptr) continue;
+    std::unique_ptr<DIR, int (*)(DIR*)> dir_guard(dir, closedir);
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+      std::string name = entry->d_name;
+
+      if (name == target_name) return true;
+
+      std::string full_path =
+          ctx.path == "." ? name : ctx.path + "/" + name;
+
+      struct stat st;
+      // lstat: never follow symlinks while walking.
+      if (lstat(full_path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+
+      if (name == "." || name == "..") continue;
+
+      auto key = std::make_pair(st.st_dev, st.st_ino);
+      if (!visited.insert(key).second) continue;  // Already walked.
+
+      stack.push_back({full_path});
     }
-
-    // Case 2: The entry is a subdirectory, so we recurse
-    std::string full_path = dir_path + "/" + name;
-    struct stat entry_stat;
-    if (stat(full_path.c_str(), &entry_stat) == 0 &&
-        S_ISDIR(entry_stat.st_mode)) {
-      // Ignore '.' and '..' to prevent infinite loops
-      if (name != "." && name != "..") {
-        if (recursive_search(full_path, target_name)) {
-          closedir(dir);
-          return true;
-        }
-      }
-    }
   }
-
-  closedir(dir);
   return false;
 }
 
-// Search Command ---
-void execute_search(const std::vector<std::string>& args,
-                    std::istream& in,
-                    std::ostream& out) {
+int execute_search(const std::vector<std::string>& args,
+                   std::istream& in,
+                   std::ostream& out) {
   if (args.size() == 2) {
-    // Case 1: Normal usage "search <name>"
-    const std::string& target_name = args[1];
-    // Start the search from the current directory "."
-    bool found = recursive_search(".", target_name);
+    bool found = recursive_search(".", args[1]);
     out << (found ? "True" : "False") << std::endl;
   } else if (args.size() == 1) {
-    // Case 2: Read names from stdin
     std::string target_name;
     while (std::getline(in, target_name)) {
+      if (!target_name.empty() && target_name.back() == '\r') {
+        target_name.pop_back();
+      }
       bool found = recursive_search(".", target_name);
       out << target_name << ": " << (found ? "True" : "False") << std::endl;
     }
   } else {
-    out << "search: incorrect number of arguments (expected 0 or 1)"
+    std::cerr << "search: incorrect number of arguments (expected 0 or 1)"
         << std::endl;
   }
+  return 0;
 }
 
-void execute_jobs(const std::vector<std::string>& args, std::ostream& out) {
-  for (size_t i = 0; i < background_jobs.size(); ++i) {
-    out << "[" << i + 1 << "] "
-        << (background_jobs[i].is_stopped ? "Stopped" : "Running") << " "
-        << background_jobs[i].command_name << " [" << background_jobs[i].pid
-        << "]" << std::endl;
+// ---------------- jobs ----------------
+
+int execute_jobs(const std::vector<std::string>& args, std::ostream& out) {
+  (void)args;
+  // Snapshot under our lock-free convention: the main thread is the only
+  // mutator, and this runs on the main thread.
+  for (const auto& job : background_jobs) {
+    out << "[" << job.id << "] " << (job.is_stopped ? "Stopped" : "Running")
+        << " " << job.command_name << " [" << job.pgid << "]" << std::endl;
   }
-}
-
-void execute_exit(const std::vector<std::string>& args, std::ostream& out) {
-  save_history_on_exit();
-  exit(0);
+  return 0;
 }

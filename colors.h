@@ -16,3 +16,7 @@ const std::string BOLD_RED = "\033[1;31m";
 const std::string BOLD_GREEN = "\033[1;32m";
 const std::string BOLD_YELLOW = "\033[1;33m";
 const std::string BOLD_BLUE = "\033[1;34m";
+
+// Colors used for job-control notices printed by the shell itself.
+const std::string DIM = "\033[2m";
+const std::string BOLD_CYAN = "\033[1;36m";

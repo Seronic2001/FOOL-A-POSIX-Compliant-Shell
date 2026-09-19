@@ -1,0 +1,8 @@
+# Build artifacts
+build/
+FOOL
+*.o
+
+# Python
+__pycache__/
+*.pyc

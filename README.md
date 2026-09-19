@@ -105,8 +105,9 @@ The project is organized into several modular files, each with a specific respon
   * **`autocomplete.cpp`**: Implements the logic for tab completion for both system commands and local files/directories.
   * **`history.cpp`**: Manages the command history, including loading from and saving to a file to ensure persistence across sessions.
   * **`prompt.cpp`**: Contains the logic for generating and displaying the dynamic shell prompt.
-  * **`shell_signals.cpp`**: Implements the signal handlers, specifically for `SIGCHLD` to manage terminated background processes.
+  * **`shell_signals.cpp`**: Implements the signal handlers. SIGCHLD uses the self-pipe trick: the handler is async-signal-safe (a single `write()` of a wake byte) and all reaping happens on the main thread, so child statuses are never lost or double-reaped.
   * **`colors.h`**: A utility header defining ANSI color codes for styled output.
+  * **`tests/`**: The test suite (unit, batch integration, and interactive pty tests) \u2014 see [Testing](#testing).
 
 -----
 
@@ -123,6 +124,45 @@ The project is organized into several modular files, each with a specific respon
     ```bash
     ./FOOL
     ```
+
+-----
+
+## Testing
+
+The project ships a three-layer test suite (98 checks total):
+
+1.  **Unit tests** (`tests/test_parser.cpp`, `tests/test_builtins.cpp`):
+    in-process C++ tests built on a minimal single-header framework
+    (`tests/test_framework.h`). They cover parsing (quoting, operators,
+    group splitting, redirections, error cases), history trimming/dedup,
+    and the pure builtins (`echo`, `search`, `pwd`, `jobs`).
+
+2.  **Batch-mode integration tests** (`tests/test_batch.py`): a Python
+    suite that feeds scripts to the compiled shell on stdin and asserts on
+    output, files, and exit codes. Covers redirections, pipelines,
+    globbing, background jobs, error handling, and regressions (e.g. the
+    child-builtin `_exit()` flush bug).
+
+3.  **Interactive pty tests** (`tests/test_interactive.py`): runs the
+    shell under a pseudo-terminal (stdlib `pty` only, no external deps) and
+    exercises the line editor the way a real user would: Ctrl+C/Ctrl+Z
+    delivery, Ctrl+D exit, history navigation, and tab completion.
+
+Run everything with:
+
+```bash
+make test              # full suite: unit + batch + interactive
+make test-unit         # C++ unit tests only
+make test-batch        # batch integration tests only
+make test-interactive  # interactive pty tests only
+# or equivalently:
+bash tests/run_tests.sh
+```
+
+The integration/interactive suites require `python3` (standard library
+only; no pip packages needed). The interactive suite needs a Unix-like
+system with pty support and will skip nothing \u2014 it runs real keypresses
+against a real terminal.
 
 -----
 

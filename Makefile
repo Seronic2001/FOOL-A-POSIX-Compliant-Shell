@@ -33,3 +33,30 @@ clean:
 # Rule to clean up everything (build directory and executables)
 distclean: clean
 	rm -f $(EXECUTABLE)
+
+# ---------------------------------------------------------------- Testing
+
+# Unit test binaries. Built from tests/test_*.cpp against the project
+# sources; headers are found via -I.
+UNIT_TESTS = $(BUILD_DIR)/test_parser $(BUILD_DIR)/test_builtins
+
+$(BUILD_DIR)/test_%: tests/test_%.cpp $(OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I. $< $(filter-out $(BUILD_DIR)/main.o,$(OBJECTS)) -o $@
+
+.PHONY: tests test-unit test-batch test-interactive test
+
+tests: $(UNIT_TESTS)
+
+test-unit: $(UNIT_TESTS)
+	$(BUILD_DIR)/test_parser
+	$(BUILD_DIR)/test_builtins
+
+test-batch: $(EXECUTABLE)
+	python3 tests/test_batch.py
+
+test-interactive: $(EXECUTABLE)
+	python3 tests/test_interactive.py
+
+# Full suite: unit, batch, interactive.
+test: test-unit test-batch test-interactive
