@@ -41,6 +41,13 @@ def run_shell(script, timeout=15, env_extra=None):
     ), proc.returncode
 
 
+def start_shell():
+    """Start FOOL with pipes, for tests that feed input in stages."""
+    return subprocess.Popen(
+        [FOOL], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE)
+
+
 def check(name, cond, detail=""):
     global PASS, FAIL
     if cond:
@@ -351,6 +358,154 @@ def test_signal_ignored_does_not_kill_shell(tmp):
     check("shell-alive", "alive" in out and rc == 0, f"out={out!r}")
 
 
+# ---------------------------------------------------------- regressions
+
+@register
+def test_ampersand_does_not_pipe(tmp):
+    # "a & b" once ran as "a | b": wc counted echo's output (6) instead of
+    # its own (empty) stdin.
+    out, err, rc = run_shell("echo hello & wc -c < /dev/null\nsleep 0.3\n")
+    lines = out.split()
+    check("amp-not-pipe", "hello" in lines and "0" in lines and
+          "6" not in lines, f"{out!r}")
+
+
+@register
+def test_stderr_to_stdout_in_pipeline(tmp):
+    out, err, rc = run_shell("ls /definitely_missing_xyz 2>&1 | cat\n")
+    check("2>&1-pipe", "definitely_missing" in out and
+          "definitely_missing" not in err, f"out={out!r} err={err!r}")
+
+
+@register
+def test_stderr_to_stdout_into_file(tmp):
+    run_shell("ls /definitely_missing_xyz > both.txt 2>&1\n")
+    with open(os.path.join(tmp, "both.txt")) as f:
+        check("2>&1-file", "definitely_missing" in f.read())
+
+
+@register
+def test_explicit_fd_redirects(tmp):
+    out, err, rc = run_shell("echo hi 1>fd1.txt\necho oops >&2\n")
+    with open(os.path.join(tmp, "fd1.txt")) as f:
+        check("fd-1>", f.read() == "hi\n" and "1>" not in out, f"{out!r}")
+    check("fd->&2", "oops" in err and "oops" not in out,
+          f"out={out!r} err={err!r}")
+
+
+@register
+def test_escaped_operators_are_literal(tmp):
+    out, err, rc = run_shell(r"echo a \; b \| c" + "\n")
+    check("escaped-operators", out == "a ; b | c\n", f"{out!r} {err!r}")
+
+
+@register
+def test_partly_quoted_word_globs(tmp):
+    os.makedirs(os.path.join(tmp, "my dir"))
+    open(os.path.join(tmp, "my dir", "x.c"), "w").write("x")
+    out, err, rc = run_shell('echo "my dir"/*.c\n')
+    check("quoted-prefix-glob", out == "my dir/x.c\n", f"{out!r}")
+
+
+@register
+def test_tilde_expansion(tmp):
+    out, err, rc = run_shell('echo ~ ~/sub "~"\n',
+                             env_extra={"HOME": "/some/home"})
+    check("tilde", out == "/some/home /some/home/sub ~\n", f"{out!r}")
+
+
+@register
+def test_exit_status_and_stops_line(tmp):
+    out, err, rc = run_shell("exit 3; echo unreachable\necho also-not\n")
+    check("exit-status", rc == 3, f"rc={rc}")
+    check("exit-stops", "unreachable" not in out and "also-not" not in out,
+          f"{out!r}")
+
+
+@register
+def test_redirect_only_creates_file(tmp):
+    run_shell("> made.txt\n")
+    check("redirect-only", os.path.exists(os.path.join(tmp, "made.txt")))
+
+
+@register
+def test_ls_plain_when_not_a_terminal(tmp):
+    os.makedirs(os.path.join(tmp, "adir"))
+    out, err, rc = run_shell("ls\nls | cat\nls > listing.txt\n")
+    with open(os.path.join(tmp, "listing.txt")) as f:
+        listing = f.read()
+    check("ls-no-color", "\x1b" not in out and "\x1b" not in listing and
+          "adir\n" in out, f"{out!r} {listing!r}")
+
+
+@register
+def test_ls_unsupported_option_uses_system_ls(tmp):
+    open(os.path.join(tmp, "one.txt"), "w").write("x")
+    out, err, rc = run_shell("ls -1\n")
+    check("ls-fallback", out == "one.txt\n" and "invalid option" not in err,
+          f"out={out!r} err={err!r}")
+
+
+@register
+def test_pipeline_error_names_the_builtin(tmp):
+    out, err, rc = run_shell("echo hi | cd /\n")
+    check("pipeline-error-name", "cd: cannot be used in a pipeline" in err,
+          f"{err!r}")
+
+
+@register
+def test_failed_redirect_does_not_leak_fds(tmp):
+    count = "ls /proc/self/fd | wc -l\n"
+    base, _, _ = run_shell(count)
+    after, _, _ = run_shell("cd < nope\ncd < nope\ncd < nope\n" + count)
+    check("no-fd-leak", base.strip() == after.strip() and base.strip(),
+          f"base={base!r} after={after!r}")
+
+
+@register
+def test_failed_write_does_not_silence_shell(tmp):
+    out, err, rc = run_shell("echo lost > /dev/full\necho after\n")
+    check("write-error-recovers", "after" in out, f"{out!r}")
+
+
+@register
+def test_background_job_does_not_eat_script(tmp):
+    out, err, rc = run_shell("cat &\necho still-here\n")
+    check("bg-stdin-detached", "still-here" in out, f"{out!r}")
+
+
+@register
+def test_piped_script_survives_background_exit(tmp):
+    # A background child exiting while the shell waits for more input used
+    # to make that read fail (EINTR), ending the script early.
+    proc = start_shell()
+    proc.stdin.write(b"sleep 0.2 &\n")
+    proc.stdin.flush()
+    time.sleep(1.0)
+    out, err = proc.communicate(b"echo AFTER\n", timeout=10)
+    check("script-survives-sigchld", b"AFTER" in out, f"{out!r}")
+
+
+@register
+def test_pinfo_reports_the_shell(tmp):
+    proc = start_shell()
+    proc.stdin.write(b"pinfo\n")
+    proc.stdin.flush()
+    lines = []
+    while not lines or not lines[-1].startswith("Executable"):
+        line = proc.stdout.readline().decode()
+        if not line:
+            break
+        lines.append(line.strip())
+    with open(f"/proc/{proc.pid}/stat") as f:
+        vsize_kb = int(f.read().rsplit(")", 1)[1].split()[20]) // 1024
+    proc.communicate(b"exit\n", timeout=10)
+    text = "\n".join(lines)
+    check("pinfo-pid", f"pid -- {proc.pid}" in text, text)
+    check("pinfo-memory", f"Memory -- {vsize_kb} KB" in text,
+          f"want {vsize_kb} KB in {text!r}")
+
+
 # ---------------------------------------------------------------- runner
 
 def main():
@@ -358,6 +513,8 @@ def main():
         print(f"FOOL binary not found at {FOOL}; build it first.", file=sys.stderr)
         return 1
     tmp = tempfile.mkdtemp(prefix="fool_test_")
+    # The shell keeps its history file in $HOME; never touch the real one.
+    os.environ["HOME"] = tmp
     try:
         old_cwd = os.getcwd()
         for fn in TESTS:

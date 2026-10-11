@@ -1,8 +1,10 @@
 #Compiler
 CXX = g++
 
-#Compiler flags:  -g for debugging info
-CXXFLAGS = -std=c++17 -g -Wall
+#Compiler flags: -g for debugging info; -MMD -MP write a .d file next to
+#each object listing the headers it includes, so editing a header rebuilds
+#everything that depends on it.
+CXXFLAGS = -std=c++17 -O2 -g -Wall -Wextra -MMD -MP
 
 #Executable name and Diretory
 EXECUTABLE = FOOL
@@ -26,6 +28,8 @@ $(EXECUTABLE): $(OBJECTS)
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(BUILD_DIR) 
 	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
+
+-include $(OBJECTS:.o=.d)
 
 # Rule to clean up the build directory
 clean:

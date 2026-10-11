@@ -36,12 +36,13 @@ FAILURES = []
 class ShellSession:
     """A FOOL process attached to a pty."""
 
-    def __init__(self, timeout=10):
+    def __init__(self, timeout=10, env_extra=None):
         self.timeout = timeout
         pid, fd = pty.fork()
         if pid == 0:
             env = dict(os.environ)
             env.setdefault("TERM", "dumb")
+            env.update(env_extra or {})
             os.execvpe(FOOL, [FOOL], env)
             os._exit(127)
         self.pid = pid
@@ -324,6 +325,103 @@ def test_background_job_notice(sess, tmp):
     check("bg-done-notice", "Done" in text, text[-300:])
 
 
+@register
+def test_background_notice_redraws_prompt(sess, tmp):
+    sess.expect("$")
+    sess.send_line("sleep 0.4 &")
+    sess.quiesce(quiet_for=0.2)
+    sess.buffer = b""
+    sess.read_available(1.2)  # No keys pressed while the job finishes.
+    text = sess.visible()
+    check("bg-notice-redraws-prompt",
+          "Done" in text and "$" in text.split("Done")[-1], text[-200:])
+
+
+@register
+def test_delete_and_modified_keys_do_not_insert_text(sess, tmp):
+    sess.expect("$")
+    sess.buffer = b""
+    # Left, then Delete removes the 'X'; Ctrl+Right is ignored.
+    sess.send("echo abX\x1b[D\x1b[3~\x1b[1;5Ccd")
+    sess.send("\r")
+    sess.quiesce()
+    text = sess.visible()
+    check("delete-key", "abcd\r\n" in text, text[-200:])
+
+
+@register
+def test_cursor_column_counts_characters_not_bytes(sess, tmp):
+    def cursor_column():
+        sess.quiesce()
+        moves = re.findall(rb"\x1b\[(\d+)C", sess.buffer)
+        return int(moves[-1]) if moves else None
+
+    sess.expect("$")
+    sess.buffer = b""
+    sess.send("echo e")
+    ascii_column = cursor_column()
+    sess.send("\x15")
+    sess.buffer = b""
+    sess.send("echo é")  # Two bytes, one column.
+    check("utf8-cursor", cursor_column() == ascii_column,
+          f"ascii={ascii_column} tail={sess.buffer[-60:]!r}")
+    sess.send("\x15")
+
+
+@register
+def test_completion_of_symlinked_command(sess, tmp):
+    sess.close()
+    bindir = os.path.join(tmp, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    link = os.path.join(bindir, "zzfoollinkcmd")
+    if not os.path.lexists(link):
+        os.symlink("/bin/true", link)
+    sess = ShellSession(
+        env_extra={"PATH": bindir + ":" + os.environ.get("PATH", "")})
+    try:
+        sess.expect("$")
+        sess.send("zzfooll\t")
+        # The first Tab scans PATH, which can outlast a quiesce() window.
+        found = sess.expect("zzfoollinkcmd", timeout=8)
+        check("tab-completes-symlink", found is not None,
+              sess.visible()[-200:])
+    finally:
+        sess.close()
+
+
+@register
+def test_completion_of_command_given_as_path(sess, tmp):
+    script = os.path.join(tmp, "runme_unique_script.sh")
+    open(script, "w").write("#!/bin/sh\n")
+    os.chmod(script, 0o755)
+    sess.expect("$")
+    sess.buffer = b""
+    sess.send("./runme_u\t")
+    sess.quiesce()
+    check("tab-completes-path-command",
+          "./runme_unique_script.sh" in sess.visible(), sess.visible()[-200:])
+    sess.send("\x15")
+
+
+@register
+def test_fg_resumes_stopped_job(sess, tmp):
+    sess.expect("$")
+    sess.send_line("sleep 1.5")
+    time.sleep(0.5)
+    sess.send("\x1a")
+    sess.quiesce()
+    check("fg-job-stopped", "Stopped" in sess.visible(), sess.visible()[-200:])
+    sess.buffer = b""
+    sess.send_line("fg")
+    sess.read_available(2.5)  # The resumed sleep runs to completion.
+    sess.buffer = b""
+    sess.send_line("jobs")
+    sess.send_line("echo jobs-listed")
+    sess.expect("jobs-listed\r\n")
+    check("fg-resumes-and-finishes", "Stopped" not in sess.visible(),
+          sess.visible()[-200:])
+
+
 def main():
     if not os.path.exists(FOOL):
         print(f"FOOL binary not found at {FOOL}; build it first.",
@@ -332,6 +430,8 @@ def main():
     tmp = tempfile.mkdtemp(prefix="fool_pty_test_")
     old_cwd = os.getcwd()
     os.chdir(tmp)
+    # The shell keeps its history file in $HOME; never touch the real one.
+    os.environ["HOME"] = tmp
     try:
         for fn in TESTS:
             print(f"* {fn.__name__}")

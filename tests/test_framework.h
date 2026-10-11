@@ -8,7 +8,7 @@
 //   TEST(parser, splits_on_semicolons) {
 //     ParseResult r = parse_input("a; b");
 //     CHECK(r.ok());
-//     CHECK_EQ(r.commands.size(), 3);  // a, b, sentinel
+//     CHECK_EQ(r.pipelines.size(), 2);
 //   }
 //
 //   int main() { return run_all_tests(); }
@@ -63,9 +63,9 @@ inline jmp_buf& jump_target() {
 }
 
 inline int run_all_tests() {
-  int total = 0;
+  volatile int total = 0;  // Modified between setjmp() and longjmp().
   for (const TestCase& tc : registry()) {
-    ++total;
+    total = total + 1;
     current_checks() = 0;
     if (setjmp(jump_target()) == 0) {
       tc.fn();

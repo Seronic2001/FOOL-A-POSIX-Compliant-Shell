@@ -2,7 +2,6 @@
 #include <pwd.h>     // For getpwuid
 #include <unistd.h>  // For getcwd, gethostname, getuid
 
-#include <iostream>
 #include <string>
 
 #include "colors.h"
@@ -56,31 +55,4 @@ std::string generate_prompt_string(void) {
 
   return BOLD_GREEN + std::string(user) + "@" + hostname_buffer + RESET + ":" +
          BOLD_BLUE + cwd + RESET + prompt_symbol + " ";
-}
-
-void display_prompt() {
-  std::cout << generate_prompt_string();
-}
-
-size_t calculate_visible_length(const std::string& s) {
-  size_t length = 0;
-  bool in_escape_sequence = false;
-
-  for (char c : s) {
-    if (!in_escape_sequence) {
-      if (c == '\033') {
-        in_escape_sequence = true;
-      } else {
-        // Only count printable columns. UTF-8 continuation bytes (0x80-0xBF)
-        // are part of the previous character's single column.
-        if ((unsigned char)c < 0x80 || (unsigned char)c >= 0xC0) {
-          length++;
-        }
-      }
-    } else if (c == 'm') {
-      // This parser only handles the SGR sequences used by colors.h.
-      in_escape_sequence = false;
-    }
-  }
-  return length;
 }

@@ -1,6 +1,4 @@
 #include <dirent.h>
-#include <fcntl.h>
-#include <glob.h>
 #include <grp.h>
 #include <limits.h>
 #include <pwd.h>
@@ -18,7 +16,6 @@
 #include <iostream>
 #include <map>
 #include <memory>
-#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -26,33 +23,38 @@
 #include "builtins.h"
 #include "colors.h"
 #include "executor.h"
-#include "history.h"
 
-extern std::string shell_home_dir;
+const std::vector<std::string>& builtin_names() {
+  static const std::vector<std::string> names = {
+      "cd", "pwd", "echo", "ls", "search", "history", "pinfo",
+      "jobs", "fg", "bg", "clear", "exit"};
+  return names;
+}
 
 // ---------------- cd ----------------
 
-void execute_cd(const std::vector<std::string>& args, std::ostream& out) {
+// `~` is expanded by the executor before the arguments get here.
+int execute_cd(const std::vector<std::string>& args, std::ostream& out) {
   if (args.size() > 2) {
-    out << "cd : too many arguments \n";
-    return;
+    std::cerr << "cd: too many arguments" << std::endl;
+    return 1;
   }
 
   static std::string previous_dir;  // Shell state, must live in the parent.
 
   std::string target_path;
 
-  if (args.size() == 1 || args[1] == "~") {
+  if (args.size() == 1) {
     const char* home_dir = getenv("HOME");
     if (home_dir == nullptr || home_dir[0] == '\0') {
       std::cerr << "cd: HOME not set" << std::endl;
-      return;
+      return 1;
     }
     target_path = home_dir;
   } else if (args[1] == "-") {
     if (previous_dir.empty()) {
       std::cerr << "cd: OLDPWD not set" << std::endl;
-      return;
+      return 1;
     }
     target_path = previous_dir;
     out << target_path << std::endl;
@@ -60,27 +62,19 @@ void execute_cd(const std::vector<std::string>& args, std::ostream& out) {
     target_path = args[1];
   }
 
-  // Resolve ~ at the start of the target (cd ~/docs).
-  if (target_path.size() >= 2 && target_path[0] == '~' &&
-      (target_path[1] == '/' || target_path.size() == 2)) {
-    const char* home_dir = getenv("HOME");
-    if (home_dir != nullptr) {
-      target_path = std::string(home_dir) + target_path.substr(1);
-    }
-  }
-
   char cwd_buffer[PATH_MAX];
   if (getcwd(cwd_buffer, sizeof(cwd_buffer)) == nullptr) {
     perror("cd: error getting current directory");
-    return;
+    return 1;
   }
 
   if (chdir(target_path.c_str()) != 0) {
     perror(("cd: " + target_path).c_str());
-  } else {
-    // Only remember the previous directory on success.
-    previous_dir = cwd_buffer;
+    return 1;
   }
+  // Only remember the previous directory on success.
+  previous_dir = cwd_buffer;
+  return 0;
 }
 
 // ---------------- pwd ----------------
@@ -142,10 +136,15 @@ std::string human_readable_size(off_t size) {
   return ss.str();
 }
 
+// Colors are only used when `color` is set (stdout is a terminal), so
+// `ls | grep` and `ls > file` see plain names.
 void print_colored_name(const struct stat& file_stat,
                         const std::string& name,
+                        bool color,
                         std::ostream& out) {
-  if (S_ISDIR(file_stat.st_mode)) {
+  if (!color) {
+    out << name;
+  } else if (S_ISDIR(file_stat.st_mode)) {
     out << BOLD_BLUE << name << RESET;
   } else if (S_ISREG(file_stat.st_mode) &&
              (file_stat.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
@@ -157,17 +156,26 @@ void print_colored_name(const struct stat& file_stat,
   }
 }
 
-// Safe wrappers: getpwuid/getgrgid return NULL for unknown ids.
-static std::string user_name(uid_t uid) {
+// getpwuid/getgrgid return NULL for unknown ids, and each call may hit the
+// user database, so results are cached for the length of a listing.
+static const std::string& user_name(uid_t uid) {
+  static std::map<uid_t, std::string> cache;
+  auto it = cache.find(uid);
+  if (it != cache.end()) return it->second;
   struct passwd* pw = getpwuid(uid);
-  if (pw != nullptr && pw->pw_name != nullptr) return pw->pw_name;
-  return std::to_string(uid);
+  return cache[uid] = (pw != nullptr && pw->pw_name != nullptr)
+                          ? pw->pw_name
+                          : std::to_string(uid);
 }
 
-static std::string group_name(gid_t gid) {
+static const std::string& group_name(gid_t gid) {
+  static std::map<gid_t, std::string> cache;
+  auto it = cache.find(gid);
+  if (it != cache.end()) return it->second;
   struct group* gr = getgrgid(gid);
-  if (gr != nullptr && gr->gr_name != nullptr) return gr->gr_name;
-  return std::to_string(gid);
+  return cache[gid] = (gr != nullptr && gr->gr_name != nullptr)
+                          ? gr->gr_name
+                          : std::to_string(gid);
 }
 
 static char type_letter(mode_t mode) {
@@ -180,24 +188,13 @@ static char type_letter(mode_t mode) {
   return '-';
 }
 
-// The basename of a path, used to display entries in long listings.
-static std::string name_of_path(const std::string& path) {
-  size_t slash = path.find_last_of('/');
-  if (slash == std::string::npos) return path;
-  if (slash + 1 >= path.size()) return path;
-  return path.substr(slash + 1);
-}
-
+// Prints one long-format line (no trailing newline) for `path`, shown as
+// `name`, from an lstat() result the caller already has.
 void print_long_format(const std::string& path,
+                       const std::string& name,
+                       const struct stat& file_stat,
                        bool human_readable,
                        std::ostream& out) {
-  struct stat file_stat;
-  // lstat: report the link itself for symlinks (like ls does).
-  if (lstat(path.c_str(), &file_stat) == -1) {
-    perror(("ls: " + path).c_str());
-    return;
-  }
-
   out << type_letter(file_stat.st_mode);
   out << ((file_stat.st_mode & S_IRUSR) ? "r" : "-");
   out << ((file_stat.st_mode & S_IWUSR) ? "w" : "-");
@@ -235,11 +232,11 @@ void print_long_format(const std::string& path,
     ssize_t len = readlink(path.c_str(), target, sizeof(target) - 1);
     if (len >= 0) {
       target[len] = '\0';
-      out << name_of_path(path) << " -> " << target;
+      out << name << " -> " << target;
       return;
     }
   }
-  out << name_of_path(path);
+  out << name;
 }
 
 struct DirectoryEntry {
@@ -251,6 +248,7 @@ void list_directory(const std::string& path,
                     bool show_all,
                     bool long_format,
                     bool human_readable,
+                    bool color,
                     std::ostream& out) {
   DIR* dir = opendir(path.c_str());
   if (dir == nullptr) {
@@ -289,71 +287,90 @@ void list_directory(const std::string& path,
 
   for (const auto& ent : entries) {
     if (long_format) {
-      // print_long_format does not emit a trailing newline.
-      print_long_format(path + "/" + ent.name, human_readable, out);
+      print_long_format(path + "/" + ent.name, ent.name, ent.stat_info,
+                        human_readable, out);
     } else {
-      print_colored_name(ent.stat_info, ent.name, out);
+      print_colored_name(ent.stat_info, ent.name, color, out);
     }
     out << "\n";
   }
 }
 
-int execute_ls(const std::vector<std::string>& args, std::ostream& out) {
+struct LsOptions {
   bool show_all = false;
   bool human_readable = false;
   bool long_format = false;
   std::vector<std::string> operands;  // Files and directories, in order.
+};
 
+// Returns the first option character that isn't supported, or 0.
+static char parse_ls_args(const std::vector<std::string>& args,
+                          LsOptions& opts) {
   for (size_t i = 1; i < args.size(); i++) {
     const std::string& arg = args[i];
-    if (arg.size() > 1 && arg[0] == '-' && arg != "--") {
-      for (char flag : arg.substr(1)) {
-        if (flag == 'l') {
-          long_format = true;
-        } else if (flag == 'a') {
-          show_all = true;
-        } else if (flag == 'h') {
-          human_readable = true;
-        } else {
-          std::cerr << "ls: invalid option -- '" << flag << "'" << std::endl;
-          return 1;
-        }
-      }
-    } else if (arg == "--") {
+    if (arg == "--") {
       // Everything after -- is an operand, even if it starts with '-'.
-      for (size_t j = i + 1; j < args.size(); j++) operands.push_back(args[j]);
+      opts.operands.insert(opts.operands.end(), args.begin() + i + 1,
+                           args.end());
       break;
-    } else {
-      operands.push_back(arg);
+    }
+    if (arg.size() < 2 || arg[0] != '-') {
+      opts.operands.push_back(arg);
+      continue;
+    }
+    for (char flag : arg.substr(1)) {
+      if (flag == 'l') {
+        opts.long_format = true;
+      } else if (flag == 'a') {
+        opts.show_all = true;
+      } else if (flag == 'h') {
+        opts.human_readable = true;
+      } else {
+        return flag;
+      }
     }
   }
+  return 0;
+}
 
-  if (operands.empty()) operands.push_back(".");
+bool ls_supports(const std::vector<std::string>& args) {
+  LsOptions opts;
+  return parse_ls_args(args, opts) == 0;
+}
 
-  // Classify operands once, preserving their relative order.
-  std::vector<std::string> files, dirs;
-  for (const auto& op : operands) {
+int execute_ls(const std::vector<std::string>& args, std::ostream& out) {
+  LsOptions opts;
+  if (char bad = parse_ls_args(args, opts)) {
+    std::cerr << "ls: invalid option -- '" << bad << "'" << std::endl;
+    return 1;
+  }
+  if (opts.operands.empty()) opts.operands.push_back(".");
+  const bool color = isatty(STDOUT_FILENO);
+  int status = 0;
+
+  // Classify operands once, preserving their relative order. A symlink to
+  // a directory is listed as the directory (stat); anything else,
+  // including a broken symlink, as itself (lstat).
+  std::vector<std::pair<std::string, struct stat>> files;
+  std::vector<std::string> dirs;
+  for (const auto& op : opts.operands) {
     struct stat path_stat;
-    // Use lstat on the operand itself: `ls broken_symlink` must list the
-    // link, and `ls symlink_to_dir` behaves like the directory (stat).
     if (stat(op.c_str(), &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
       dirs.push_back(op);
     } else if (lstat(op.c_str(), &path_stat) == 0) {
-      files.push_back(op);
+      files.emplace_back(op, path_stat);
     } else {
       std::cerr << "ls: cannot access '" << op << "': "
           << std::strerror(errno) << std::endl;
+      status = 1;
     }
   }
 
-  for (const auto& path : files) {
-    if (long_format) {
-      print_long_format(path, human_readable, out);
+  for (const auto& [path, path_stat] : files) {
+    if (opts.long_format) {
+      print_long_format(path, path, path_stat, opts.human_readable, out);
     } else {
-      struct stat st;
-      if (lstat(path.c_str(), &st) == 0) {
-        print_colored_name(st, path, out);
-      }
+      print_colored_name(path_stat, path, color, out);
     }
     out << "\n";
   }
@@ -364,10 +381,11 @@ int execute_ls(const std::vector<std::string>& args, std::ostream& out) {
     if (files.size() + dirs.size() > 1) {
       out << dirs[i] << ":" << "\n";
     }
-    list_directory(dirs[i], show_all, long_format, human_readable, out);
+    list_directory(dirs[i], opts.show_all, opts.long_format,
+                   opts.human_readable, color, out);
     if (i < dirs.size() - 1) out << "\n";
   }
-  return 0;
+  return status;
 }
 
 int execute_clear(const std::vector<std::string>& args, std::ostream& out) {
@@ -379,8 +397,9 @@ int execute_clear(const std::vector<std::string>& args, std::ostream& out) {
 // ---------------- pinfo ----------------
 
 // /proc/<pid>/stat's comm field (2nd) is "(...)" and may contain spaces.
-// Parse defensively: find the closing ')' and scan fields after it.
-static bool parse_proc_stat(pid_t pid, char* state, pid_t* pgrp,
+// Parse defensively: find the closing ')' and split the fields after it.
+// `foreground` is set when the process group owns its terminal.
+static bool parse_proc_stat(pid_t pid, char* state, bool* foreground,
                             unsigned long* vsize) {
   std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
   std::ifstream f(stat_path);
@@ -392,36 +411,27 @@ static bool parse_proc_stat(pid_t pid, char* state, pid_t* pgrp,
   size_t close_paren = content.rfind(')');
   if (close_paren == std::string::npos) return false;
 
-  // Fields after comm: state pgrp session ... vsize is field 23 overall.
-  // After ')' the remainder starts at overall field 3 => remainder index 0
-  // is state, index 2 is pgrp (3,4,5 of the line: "state pgrp session").
+  // fields[i] is field i + 3 of proc(5): state(3) ppid(4) pgrp(5)
+  // session(6) tty_nr(7) tpgid(8) ... vsize(23).
   std::istringstream rest(content.substr(close_paren + 1));
-  std::string state_tok, pgrp_tok;
-  if (!(rest >> state_tok)) return false;
-  if (!(rest >> pgrp_tok)) return false;
+  std::vector<std::string> fields;
+  for (std::string field; rest >> field;) fields.push_back(field);
+  if (fields.size() < 21) return false;
 
-  // Skip to vsize (overall field 23 => remainder field 21).
-  unsigned long skip;
-  for (int i = 0; i < 17; ++i) {
-    if (!(rest >> skip)) return false;  // fields 6..22 overall
-  }
-  std::string vsize_tok;
-  if (!(rest >> vsize_tok)) return false;
-
-  *state = state_tok[0];
-  *pgrp = (pid_t)std::strtol(pgrp_tok.c_str(), nullptr, 10);
-  *vsize = std::strtoul(vsize_tok.c_str(), nullptr, 10);
+  *state = fields[0][0];
+  *foreground = fields[2] == fields[5];  // pgrp == tpgid
+  *vsize = std::strtoul(fields[20].c_str(), nullptr, 10);
   return true;
 }
 
-void print_process_info(pid_t pid, std::ostream& out) {
+static int print_process_info(pid_t pid, std::ostream& out) {
   char state = '?';
-  pid_t pgrp = 0;
+  bool foreground = false;
   unsigned long vsize = 0;
 
-  if (!parse_proc_stat(pid, &state, &pgrp, &vsize)) {
+  if (!parse_proc_stat(pid, &state, &foreground, &vsize)) {
     std::cerr << "pinfo: process with pid " << pid << " not found" << std::endl;
-    return;
+    return 1;
   }
 
   std::string exe_path = "path not accessible";
@@ -447,13 +457,13 @@ void print_process_info(pid_t pid, std::ostream& out) {
   }
 
   std::string state_str = std::string(1, state) + " {" + state_name + "}";
-  pid_t terminal_pgrp = tcgetpgrp(STDIN_FILENO);
-  if (pgrp == terminal_pgrp) state_str += "+";
+  if (foreground) state_str += "+";
 
   out << "pid -- " << pid << std::endl;
   out << "Process Status -- " << state_str << std::endl;
   out << "Memory -- " << vsize / 1024 << " KB {Virtual Memory}" << std::endl;
   out << "Executable Path -- " << exe_path << std::endl;
+  return 0;
 }
 
 int execute_pinfo(const std::vector<std::string>& args, std::ostream& out) {
@@ -476,52 +486,39 @@ int execute_pinfo(const std::vector<std::string>& args, std::ostream& out) {
       return 1;
     }
   }
-  print_process_info(target_pid, out);
-  return 0;
+  return print_process_info(target_pid, out);
 }
 
 // ---------------- search ----------------
 
-// Iterative DFS with a visited-(device,inode) set: immune to symlink loops
-// and to directory cycles that a recursive stat()-based walker would chase
-// forever (or stack-overflow on).
+// Iterative DFS. Symlinks are never followed, so the walk cannot loop,
+// and readdir's d_type spares an lstat() per entry on most filesystems.
 static bool recursive_search(const std::string& root,
                              const std::string& target_name) {
-  struct Ctx {
-    std::string path;
-  };
-
-  std::set<std::pair<dev_t, ino_t>> visited;
-  std::vector<Ctx> stack;
-  stack.push_back({root});
+  std::vector<std::string> stack = {root};
 
   while (!stack.empty()) {
-    Ctx ctx = stack.back();
+    const std::string dir_path = std::move(stack.back());
     stack.pop_back();
 
-    DIR* dir = opendir(ctx.path.c_str());
+    DIR* dir = opendir(dir_path.c_str());
     if (dir == nullptr) continue;
     std::unique_ptr<DIR, int (*)(DIR*)> dir_guard(dir, closedir);
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
-      std::string name = entry->d_name;
-
+      const std::string name = entry->d_name;
       if (name == target_name) return true;
-
-      std::string full_path =
-          ctx.path == "." ? name : ctx.path + "/" + name;
-
-      struct stat st;
-      // lstat: never follow symlinks while walking.
-      if (lstat(full_path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-
       if (name == "." || name == "..") continue;
 
-      auto key = std::make_pair(st.st_dev, st.st_ino);
-      if (!visited.insert(key).second) continue;  // Already walked.
+      std::string full_path = dir_path == "." ? name : dir_path + "/" + name;
 
-      stack.push_back({full_path});
+      bool is_dir = entry->d_type == DT_DIR;
+      if (entry->d_type == DT_UNKNOWN) {
+        struct stat st;
+        is_dir = lstat(full_path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+      }
+      if (is_dir) stack.push_back(std::move(full_path));
     }
   }
   return false;
@@ -553,8 +550,6 @@ int execute_search(const std::vector<std::string>& args,
 
 int execute_jobs(const std::vector<std::string>& args, std::ostream& out) {
   (void)args;
-  // Snapshot under our lock-free convention: the main thread is the only
-  // mutator, and this runs on the main thread.
   for (const auto& job : background_jobs) {
     out << "[" << job.id << "] " << (job.is_stopped ? "Stopped" : "Running")
         << " " << job.command_name << " [" << job.pgid << "]" << std::endl;

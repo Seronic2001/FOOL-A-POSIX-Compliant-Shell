@@ -1,156 +1,97 @@
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 
 #include "parser.h"
 
 namespace {
 
-// Returns true if the token is an operator token (unquoted <, >, >>, 2>,
-// 2>>, 2>&, |, ;, &).
-bool is_operator_token(const Token& tok) {
-  if (tok.quoted) return false;
-  return tok.text == ";" || tok.text == "|" || tok.text == "&" ||
-         tok.text == "<" || tok.text == ">" || tok.text == ">>" ||
-         tok.text == "2>" || tok.text == "2>>" || tok.text == "2>&";
+bool is_glob_meta(char c) { return c == '*' || c == '?' || c == '['; }
+
+bool is_all_digits(const std::string& s) {
+  return !s.empty() && s.size() <= 9 &&
+         std::all_of(s.begin(), s.end(), [](char d) {
+           return std::isdigit(static_cast<unsigned char>(d)) != 0;
+         });
 }
 
-// Parses tokens [start, end) as one command (argv + redirections).
-void parse_command(const std::vector<Token>& tokens, size_t start, size_t end,
-                   bool background, ParseResult& result) {
-  Command command;
-  command.background = background;
+// A lexical token: either a word or an operator (; | & < > >> >&).
+struct Token {
+  bool is_word = false;
+  Word word;
+  std::string op;
+  int fd = -1;  // Explicit descriptor prefix on a redirection ("2>"), or -1.
+};
 
-  for (size_t i = start; i < end; ++i) {
-    const Token& tok = tokens[i];
+// Accumulates one word, tracking which characters were quoted so that only
+// unquoted metacharacters glob (`"my dir"/*.c` still expands the `*`).
+struct WordBuilder {
+  Word word;
+  bool active = false;      // A word is in progress (possibly empty: "").
+  bool any_quoted = false;  // Some part came from quotes or a backslash.
+  bool has_meta = false;    // An unquoted glob metacharacter is present.
 
-    if (!is_operator_token(tok)) {
-      command.args.push_back(tok.text);
-      command.arg_is_globbed.push_back(!tok.quoted && tok.has_metachar);
-      continue;
-    }
-
-    if (tok.text == "2>&") {
-      if (i + 1 < end && !tokens[i + 1].quoted && tokens[i + 1].text == "1") {
-        command.stderr_to_stdout = true;
-        ++i;
-        continue;
-      }
-      result.error = "syntax error: `2>&' must be immediately followed by `1'";
-      return;
-    }
-
-    // All other operators require a following filename token.
-    if (i + 1 >= end || is_operator_token(tokens[i + 1])) {
-      result.error = "syntax error near unexpected token `" + tok.text + "'";
-      return;
-    }
-    const std::string& filename = tokens[i + 1].text;
-
-    if (tok.text == "<") {
-      command.stdin_file = filename;
-    } else if (tok.text == ">") {
-      command.stdout_file = filename;
-      command.append_out = false;
-    } else if (tok.text == ">>") {
-      command.stdout_file = filename;
-      command.append_out = true;
-    } else if (tok.text == "2>") {
-      command.stderr_file = filename;
-      command.append_err = false;
-    } else if (tok.text == "2>>") {
-      command.stderr_file = filename;
-      command.append_err = true;
-    } else {
-      result.error = "syntax error near unexpected token `" + tok.text + "'";
-      return;
-    }
-    ++i;  // Skip the filename token.
+  void add_literal(char c) {
+    word.text += c;
+    word.pattern += glob_escape(std::string(1, c));
+    active = any_quoted = true;
   }
 
-  result.commands.push_back(command);
-}
-
-// Parses tokens [start, end) as a pipeline: commands separated by unquoted
-// '|'. Empty segments are syntax errors ("| a", "a |", "a || b").
-void parse_pipeline(const std::vector<Token>& tokens, size_t start, size_t end,
-                    bool background, ParseResult& result) {
-  size_t cmd_start = start;
-  for (size_t i = start; i <= end; ++i) {
-    bool is_end = (i == end);
-    bool is_pipe = !is_end && tokens[i].text == "|" && !tokens[i].quoted;
-    if (!is_end && !is_pipe) continue;
-
-    if (i == cmd_start) {
-      result.error = "syntax error near unexpected token `|'";
-      return;
-    }
-    parse_command(tokens, cmd_start, i, background, result);
-    if (!result.ok()) return;
-    cmd_start = i + 1;
+  void add_unquoted(char c) {
+    if (!active && c == '~') word.tilde = true;
+    if (is_glob_meta(c)) has_meta = true;
+    word.text += c;
+    word.pattern += c;
+    active = true;
   }
-}
 
-// Parses tokens [start, end) as a ';'-separated group, splitting on
-// unquoted '&' into background/foreground pipeline segments.
-void parse_group(const std::vector<Token>& tokens, size_t start, size_t end,
-                 ParseResult& result) {
-  size_t seg_start = start;
-  for (size_t i = start; i <= end; ++i) {
-    bool is_end = (i == end);
-    bool is_amp = !is_end && tokens[i].text == "&" && !tokens[i].quoted;
-    if (!is_end && !is_amp) continue;
+  void reset() { *this = WordBuilder(); }
+};
 
-    // '&' with an empty segment before it: leading '&', "&&", or "a & &".
-    if (is_amp && i == seg_start) {
-      result.error = "syntax error near unexpected token `&'";
-      return;
-    }
-
-    if (seg_start < i) {
-      // A segment terminated by '&' runs in the background; the final
-      // segment (terminated by end-of-group) runs in the foreground.
-      parse_pipeline(tokens, seg_start, i, is_amp, result);
-      if (!result.ok()) return;
-    }
-    seg_start = i + 1;
-  }
-}
-
-// Character-by-character tokenizer. Handles quotes, splits unquoted
-// metacharacters into standalone operator tokens (so `ls>/dev/null` works),
-// tracks quoting/globbing metadata per word, and supports backslash escapes.
-// Returns false on an unterminated quote.
+// Character-by-character tokenizer. Handles quotes and backslash escapes,
+// and splits unquoted metacharacters into standalone operator tokens (so
+// `ls>/dev/null` works). Returns false on an unterminated quote.
 bool tokenize_line(const std::string& input, std::vector<Token>& tokens) {
-  std::string current;
-  bool current_quoted = false;
-  bool current_meta = false;
+  WordBuilder current;
   char quote = 0;
 
   auto flush = [&]() {
-    if (current.empty() && !current_quoted) return;
-    tokens.emplace_back(current, current_quoted, current_meta);
-    current.clear();
-    current_quoted = false;
-    current_meta = false;
+    if (!current.active) return;
+    Token tok;
+    tok.is_word = true;
+    tok.word = std::move(current.word);
+    if (!current.has_meta) tok.word.pattern.clear();
+    tokens.push_back(std::move(tok));
+    current.reset();
+  };
+
+  auto push_op = [&](const std::string& op, int fd = -1) {
+    Token tok;
+    tok.op = op;
+    tok.fd = fd;
+    tokens.push_back(std::move(tok));
   };
 
   for (size_t i = 0; i < input.size(); ++i) {
-    char c = input[i];
+    const char c = input[i];
+    const char next = (i + 1 < input.size()) ? input[i + 1] : '\0';
 
     if (quote != 0) {  // Inside '...' or "..."
       if (c == quote) {
         quote = 0;
-        current_quoted = true;  // The word contains quoted characters.
+      } else if (quote == '"' && c == '\\' &&
+                 (next == '"' || next == '\\' || next == '$' || next == '`')) {
+        current.add_literal(next);
+        ++i;
       } else {
-        current += c;
-        current_quoted = true;
+        current.add_literal(c);
       }
       continue;
     }
 
     if (c == '\'' || c == '"') {
       quote = c;
-      current_quoted = true;
+      current.active = current.any_quoted = true;
       continue;
     }
 
@@ -159,68 +100,47 @@ bool tokenize_line(const std::string& input, std::vector<Token>& tokens) {
       continue;
     }
 
-    // Backslash escape: the next character joins the word literally and
-    // suppresses globbing (a backslashed '*' is literal).
+    // Backslash escape: the next character joins the word literally, so an
+    // escaped operator or glob character loses its special meaning.
     if (c == '\\' && i + 1 < input.size()) {
-      char next = input[++i];
-      if (next == '*' || next == '?') current_quoted = true;
-      current += next;
+      current.add_literal(next);
+      ++i;
       continue;
     }
 
-    if (c == '<') {
-      flush();
-      tokens.emplace_back("<", false, false);
-      continue;
-    }
-
-    if (c == '>') {
-      const bool next_gt = (i + 1 < input.size()) && input[i + 1] == '>';
-      const bool next_amp = (i + 1 < input.size()) && input[i + 1] == '&';
+    if (c == '<' || c == '>') {
       // A run of unquoted digits immediately before the operator is an fd
       // number ("2>" redirects stderr), matching POSIX behavior.
-      const bool digits_before =
-          !current.empty() && !current_quoted &&
-          std::all_of(current.begin(), current.end(), [](char d) {
-            return std::isdigit(static_cast<unsigned char>(d)) != 0;
-          });
-      std::string digits;
-      if (digits_before) {
-        digits = current;
-        current.clear();
-        current_quoted = false;
-        current_meta = false;
+      int fd = -1;
+      if (current.active && !current.any_quoted &&
+          is_all_digits(current.word.text)) {
+        fd = std::atoi(current.word.text.c_str());
+        current.reset();
       } else {
         flush();
       }
 
-      if (next_gt) {
-        ++i;  // Consume the second '>'.
-        tokens.emplace_back(digits.empty() ? ">>" : digits + ">>", false,
-                            false);
-      } else if (next_amp) {
-        if (digits.empty()) {
-          // Bare '>&' is not supported; emit '>' and let the '&' surface a
-          // syntax error downstream.
-          tokens.emplace_back(">", false, false);
-        } else {
-          ++i;  // Consume the '&'.
-          tokens.emplace_back(digits + ">&", false, false);
-        }
+      if (c == '<') {
+        push_op("<", fd);
+      } else if (next == '>') {
+        ++i;
+        push_op(">>", fd);
+      } else if (next == '&') {
+        ++i;
+        push_op(">&", fd);
       } else {
-        tokens.emplace_back(digits.empty() ? ">" : digits + ">", false, false);
+        push_op(">", fd);
       }
       continue;
     }
 
     if (c == ';' || c == '|' || c == '&') {
       flush();
-      tokens.emplace_back(std::string(1, c), false, false);
+      push_op(std::string(1, c));
       continue;
     }
 
-    if (c == '*' || c == '?') current_meta = true;
-    current += c;
+    current.add_unquoted(c);
   }
 
   if (quote != 0) return false;  // Unterminated quote.
@@ -228,7 +148,20 @@ bool tokenize_line(const std::string& input, std::vector<Token>& tokens) {
   return true;
 }
 
+bool is_redirect_op(const std::string& op) {
+  return op == "<" || op == ">" || op == ">>" || op == ">&";
+}
+
 }  // namespace
+
+std::string glob_escape(const std::string& s) {
+  std::string out;
+  for (char c : s) {
+    if (is_glob_meta(c) || c == ']' || c == '\\') out += '\\';
+    out += c;
+  }
+  return out;
+}
 
 ParseResult parse_input(const std::string& input_line) {
   ParseResult result;
@@ -236,34 +169,80 @@ ParseResult parse_input(const std::string& input_line) {
 
   if (!tokenize_line(input_line, tokens)) {
     result.error = "unexpected EOF while looking for matching quote";
+    result.incomplete = true;
     return result;
   }
 
-  // Split into ';'-separated groups. Each group is followed by an explicit
-  // end-of-group sentinel so the executor knows the group boundaries; without
-  // them the executor would run "a; b" as the pipeline "a | b".
-  size_t group_start = 0;
+  auto unexpected = [&](const std::string& token) {
+    result.pipelines.clear();
+    result.error = "syntax error near unexpected token `" + token + "'";
+    return result;
+  };
+
+  Pipeline pipeline;
+  Command command;
+
   for (size_t i = 0; i <= tokens.size(); ++i) {
     const bool is_end = (i == tokens.size());
-    const bool is_semi = !is_end && tokens[i].text == ";" && !tokens[i].quoted;
-    if (is_end || is_semi) {
-      // Only non-empty ranges form a group; a trailing ';' (or ';;') must
-      // not create a phantom empty group.
-      if (group_start < i) {
-        parse_group(tokens, group_start, i, result);
-        if (!result.ok()) return result;
-        Command group_end;
-        group_end.is_group_end = true;
-        result.commands.push_back(group_end);
-      }
-      group_start = i + 1;
+
+    if (!is_end && tokens[i].is_word) {
+      command.words.push_back(tokens[i].word);
+      continue;
     }
+
+    if (!is_end && is_redirect_op(tokens[i].op)) {
+      const Token& tok = tokens[i];
+      // Every redirection needs a following word (file name or fd number).
+      if (i + 1 >= tokens.size() || !tokens[i + 1].is_word) {
+        return unexpected(tok.op);
+      }
+      const Word& target = tokens[++i].word;
+
+      Redirect redirect;
+      if (tok.op == "<") {
+        redirect.kind = Redirect::kIn;
+        redirect.fd = tok.fd < 0 ? 0 : tok.fd;
+        redirect.target = target;
+      } else if (tok.op == ">&") {
+        if (!is_all_digits(target.text)) {
+          result.error =
+              "syntax error: `>&' must be followed by a file descriptor";
+          return result;
+        }
+        redirect.kind = Redirect::kDup;
+        redirect.fd = tok.fd < 0 ? 1 : tok.fd;
+        redirect.dup_fd = std::atoi(target.text.c_str());
+      } else {
+        redirect.kind = (tok.op == ">>") ? Redirect::kAppend : Redirect::kOut;
+        redirect.fd = tok.fd < 0 ? 1 : tok.fd;
+        redirect.target = target;
+      }
+      command.redirects.push_back(std::move(redirect));
+      continue;
+    }
+
+    // A separator: '|', ';', '&', or end of input.
+    const std::string op = is_end ? "" : tokens[i].op;
+
+    if (op == "|") {
+      // Empty pipeline stage: "| a" or "a || b".
+      if (command.empty()) return unexpected("|");
+      pipeline.commands.push_back(std::move(command));
+      command = Command();
+      continue;
+    }
+
+    if (command.empty()) {
+      if (!pipeline.commands.empty()) return unexpected("|");  // "a |"
+      if (op == "&") return unexpected("&");  // "& a", "a && b", "a & &"
+      continue;  // Empty statement: a trailing ';' or ';;' is harmless.
+    }
+
+    pipeline.commands.push_back(std::move(command));
+    command = Command();
+    pipeline.background = (op == "&");
+    result.pipelines.push_back(std::move(pipeline));
+    pipeline = Pipeline();
   }
   return result;
-}
-
-std::vector<Command> parse_input_or_empty(const std::string& commands) {
-  ParseResult result = parse_input(commands);
-  if (!result.ok()) return {};
-  return result.commands;
 }

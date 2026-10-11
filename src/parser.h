@@ -3,42 +3,47 @@
 #include <string>
 #include <vector>
 
-// A lexical token with the metadata the parser needs to apply shell
-// semantics correctly (quoting suppresses globbing and operator meaning).
-struct Token {
-  std::string text;
-  bool quoted = false;  // Character came from inside '...' or "..."
-  bool has_metachar =
-      false;  // Unquoted '*' or '?' present -> candidate for globbing.
+// One shell word after quote removal.
+struct Word {
+  std::string text;     // Literal value.
+  std::string pattern;  // glob(3) pattern with quoted characters escaped;
+                        // empty when the word has no unquoted metacharacter.
+  bool tilde = false;   // Starts with an unquoted '~'.
+};
 
-  Token() = default;
-  Token(std::string t, bool q, bool meta)
-      : text(std::move(t)), quoted(q), has_metachar(meta) {}
+// One redirection, applied in the order written.
+struct Redirect {
+  enum Kind { kIn, kOut, kAppend, kDup };
+  Kind kind = kOut;
+  int fd = 1;       // The descriptor being redirected.
+  Word target;      // File name (kIn / kOut / kAppend).
+  int dup_fd = -1;  // Source descriptor for kDup (N>&M).
 };
 
 // One command in a pipeline.
 struct Command {
-  std::vector<std::string> args;      // e.g., {"ls", "-l", "/home"}
-  std::vector<bool> arg_is_globbed;   // args[i] may be expanded by globbing
-  bool background = false;            // Set to true if '&' was seen
-  std::string stdin_file;             // For <
-  std::string stdout_file;            // For > or >>
-  std::string stderr_file;            // For 2> or 2>>
-  bool stderr_to_stdout = false;      // For 2>&1
-  bool append_out = false;   // To distinguish > (overwrite) from >> (append)
-  bool append_err = false;   // To distinguish 2> (overwrite) from 2>> (append)
-  bool is_group_end = false;  // Sentinel: end of a ';'-separated group.
+  std::vector<Word> words;          // e.g., {"ls", "-l", "/home"}
+  std::vector<Redirect> redirects;
+
+  bool empty() const { return words.empty() && redirects.empty(); }
 };
 
-// Result of parsing: either a list of commands or an error message.
+// Commands joined by '|', terminated by ';', '&' or end of line.
+struct Pipeline {
+  std::vector<Command> commands;
+  bool background = false;  // Terminated by '&'.
+};
+
+// Result of parsing: either a list of pipelines or an error message.
 struct ParseResult {
-  std::vector<Command> commands;  // Group-end sentinel commands included.
-  std::string error;              // Empty if no error.
+  std::vector<Pipeline> pipelines;
+  std::string error;        // Empty if no error.
+  bool incomplete = false;  // The error is an unterminated quote.
   bool ok() const { return error.empty(); }
 };
 
-// Tokenizes and parses an input line into commands. Never throws.
-ParseResult parse_input(const std::string& commands);
+// Tokenizes and parses an input line. Never throws.
+ParseResult parse_input(const std::string& input_line);
 
-// Backwards-compatible convenience wrapper (discards the error message).
-std::vector<Command> parse_input_or_empty(const std::string& commands);
+// Backslash-escapes glob(3) metacharacters so `s` matches only itself.
+std::string glob_escape(const std::string& s);

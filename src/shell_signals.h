@@ -4,30 +4,29 @@
 #include <csignal>
 #include <sys/types.h>
 
-// SIGCHLD handling uses the "self-pipe" trick: the signal handler does no
-// reaping and touches no data structures -- it just writes one byte to a
-// pipe. All waitpid() calls happen on the main thread, in the executor, so
-// there is exactly one reaper and statuses are never stolen or lost.
+// Signal handling uses the "self-pipe" trick: the handlers do no reaping
+// and touch no data structures -- they just write one byte to a pipe. The
+// line editor poll()s that pipe alongside stdin, so a signal can never be
+// missed between checking for it and blocking. All waitpid() calls happen
+// on the main thread, in the executor, so there is exactly one reaper and
+// statuses are never stolen or lost.
 
-// Set (async-signal-safely) when SIGINT is delivered while the shell itself
-// owns the terminal. Consumed and cleared by the line editor / main loop.
+// Set (async-signal-safely) when SIGINT is delivered to the shell itself.
+// Consumed and cleared by the line editor.
 extern std::atomic<bool> got_sigint;
 
-// Set when the `exit` builtin or Ctrl+D requests shell shutdown.
+// Set when the `exit` builtin or end of input requests shell shutdown;
+// shell_exit_status is what main() then returns.
 extern std::atomic<bool> shell_exit_requested;
-
-// The Ctrl+C handler.
-void sigint_handler(int signo);
+extern int shell_exit_status;
 
 // Installs handlers and creates the self-pipe. Must be called once before
-// any child can be spawned.
-void setup_signal_handlers();
+// any child can be spawned. SIGINT is only caught by an interactive shell;
+// a script run is interrupted like any other process.
+void setup_signal_handlers(bool interactive);
 
-// Wakes the main thread after a child state change (written by the SIGCHLD
-// handler; async-signal-safe).
-void notify_child_event(void);
+// Read end of the self-pipe: readable after SIGCHLD or SIGINT.
+int signal_event_fd();
 
 // Drains all pending wake notifications from the self-pipe. Non-blocking.
-// Returns the number of notifications drained. Call only from the main
-// thread, before doing waitpid() work that the notifications signal.
-size_t drain_child_events(void);
+void drain_signal_events();

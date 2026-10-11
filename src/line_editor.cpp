@@ -1,18 +1,21 @@
-#include <sys/ioctl.h>
+#include <poll.h>
 #include <termios.h>
 #include <unistd.h>
 
 #include <cerrno>
-#include <csignal>
-#include <cstring>
+#include <cstdio>
+#include <functional>
 #include <iostream>
 
 #include "autocomplete.h"
 #include "executor.h"
 #include "history.h"
 #include "line_editor.h"
+#include "parser.h"
 #include "prompt.h"
 #include "shell_signals.h"
+
+namespace {
 
 void enable_raw_mode(struct termios& orig_termios) {
   tcgetattr(STDIN_FILENO, &orig_termios);
@@ -29,33 +32,39 @@ void disable_raw_mode(const struct termios& orig_termios) {
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
 }
 
-namespace {
-
-// Read one byte, retrying on EINTR. Returns: 1 = byte read, 0 = EOF,
+// Reads one byte of keyboard input. Returns: 1 = byte read, 0 = EOF,
 // -1 = SIGINT arrived (caller should abort the current line).
-int read_byte(char& out) {
+//
+// Waits on the keyboard and the signal self-pipe together, so a background
+// job finishing mid-edit is reported immediately; `redraw` then repaints
+// the prompt that the notice overwrote.
+int read_byte(char& out, const std::function<void()>& redraw) {
   while (true) {
-    ssize_t n = read(STDIN_FILENO, &out, 1);
-    if (n == 1) return 1;
-    if (n < 0 && errno == EINTR) {
-      // A child changed state mid-edit; update job notices now.
-      reap_finished_children();
-      // Ctrl+C may have interrupted this very read. Abort the line so the
-      // shell can show a fresh prompt immediately (bash behavior).
-      if (got_sigint.exchange(false)) return -1;
-      continue;
+    if (got_sigint) return -1;
+
+    struct pollfd fds[2] = {{STDIN_FILENO, POLLIN, 0},
+                            {signal_event_fd(), POLLIN, 0}};
+    if (poll(fds, 2, -1) < 0) {
+      if (errno == EINTR) continue;
+      return 0;
     }
-    return 0;  // EOF or real error
+    if (fds[1].revents != 0 && reap_finished_children()) redraw();
+    if (fds[0].revents != 0) {
+      ssize_t n = read(STDIN_FILENO, &out, 1);
+      if (n == 1) return 1;
+      if (n < 0 && errno == EINTR) continue;
+      return 0;  // EOF or real error
+    }
   }
 }
 
-// Number of columns a UTF-8 character occupies (approximation: 1 per code
-// point). Continuation bytes (10xxxxxx) do not advance the cursor.
+// Continuation bytes (10xxxxxx) belong to the preceding UTF-8 character.
 bool is_utf8_continuation(unsigned char c) {
   return (c & 0xC0) == 0x80;
 }
 
-// Number of terminal columns the string occupies, ignoring ANSI escapes.
+// Number of terminal columns the string occupies (approximation: one per
+// code point), ignoring ANSI color escapes.
 size_t visible_width(const std::string& s) {
   size_t width = 0;
   bool in_escape = false;
@@ -73,64 +82,42 @@ size_t visible_width(const std::string& s) {
   return width;
 }
 
-// Returns true if, scanning `line`, all quote characters are closed.
-// Backslash escapes are honored outside quotes.
-static bool quotes_balanced(const std::string& line) {
-  char quote = 0;
-  for (size_t i = 0; i < line.size(); ++i) {
-    char c = line[i];
-    if (quote != 0) {
-      if (c == quote) quote = 0;
-      continue;
-    }
-    if (c == '\'' || c == '"') {
-      quote = c;
-    } else if (c == '\\') {
-      ++i;  // Skip the escaped character.
-    }
-  }
-  return quote == 0;
-}
-
-std::string run_batch_line() {
+// Reads one command from non-terminal input. A line with an open quote
+// continues onto the next physical line, like a real shell's secondary
+// prompt.
+std::string read_batch_line() {
   std::string line;
-  int c;
-  while ((c = getchar()) != EOF) {
-    if (c == '\n' || c == '\r') break;
-    line += (char)c;
-  }
-  bool hit_eof = (c == EOF);
-  // A batch line with an open quote continues onto the next physical line,
-  // like a real shell's secondary prompt. Loop until balanced or EOF.
-  while (!hit_eof && !quotes_balanced(line)) {
-    line += '\n';
-    while ((c = getchar()) != EOF) {
-      if (c == '\n' || c == '\r') break;
+  while (true) {
+    int c;
+    while ((c = getchar()) != EOF && c != '\n' && c != '\r') {
       line += (char)c;
     }
-    hit_eof = (c == EOF);
+    if (c == EOF) {
+      if (line.empty()) shell_exit_requested = true;
+      return line;
+    }
+    if (!parse_input(line).incomplete) return line;
+    line += '\n';
   }
-  if (hit_eof && line.empty()) {
-    shell_exit_requested = true;  // Ctrl+D in batch mode
-  }
-  return line;
 }
 
 }  // namespace
 
 std::string read_command_line() {
+  if (!shell_interactive) return read_batch_line();
+
+  got_sigint = false;  // A stale Ctrl+C must not discard this line.
+
   struct termios orig_termios;
-  bool interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
-
-  if (!interactive) {
-    return run_batch_line();
-  }
-
   enable_raw_mode(orig_termios);
 
+  // The prompt cannot change while a line is being edited.
+  const std::string prompt = generate_prompt_string();
+  const size_t prompt_width = visible_width(prompt);
+
   std::string line;
-  size_t cursor_pos = 0;
-  static bool last_key_was_tab = false;
+  size_t cursor_pos = 0;  // Byte offset into `line`.
+  bool last_key_was_tab = false;
 
   // State for history navigation.
   const auto& history = get_history();
@@ -138,52 +125,74 @@ std::string read_command_line() {
   std::string current_buffer;
 
   auto redraw_line = [&]() {
-    std::string prompt = generate_prompt_string();
-    size_t prompt_len = visible_width(prompt);
-    std::cout << "\r\x1b[K" << std::flush;
-    display_prompt();
-    std::cout << line << std::flush;
-    if (prompt_len + cursor_pos > 0) {
-      std::cout << "\r\x1b[" << (prompt_len + cursor_pos) << "C" << std::flush;
+    std::string out = "\r\x1b[K" + prompt + line + "\r";
+    size_t column = prompt_width + visible_width(line.substr(0, cursor_pos));
+    if (column > 0) out += "\x1b[" + std::to_string(column) + "C";
+    std::cout << out << std::flush;
+  };
+
+  auto finish = [&](const char* trailer) {
+    disable_raw_mode(orig_termios);
+    std::cout << trailer << std::flush;
+  };
+
+  // Called after the user changes the text: it is no longer a history
+  // entry being browsed.
+  auto edited = [&]() {
+    history_index = history.size();
+    current_buffer = line;
+  };
+
+  // Start of the UTF-8 character before `pos` / end of the one at `pos`.
+  auto prev_char = [&](size_t pos) {
+    if (pos > 0) pos--;
+    while (pos > 0 && is_utf8_continuation((unsigned char)line[pos])) pos--;
+    return pos;
+  };
+  auto next_char = [&](size_t pos) {
+    if (pos < line.size()) pos++;
+    while (pos < line.size() &&
+           is_utf8_continuation((unsigned char)line[pos])) {
+      pos++;
     }
+    return pos;
+  };
+
+  auto recall_history = [&](size_t index) {
+    if (history_index == history.size()) current_buffer = line;
+    history_index = index;
+    line = (index == history.size()) ? current_buffer : history[index];
+    cursor_pos = line.size();
   };
 
   redraw_line();
 
   while (true) {
     char c;
-    int rr = read_byte(c);
-    if (rr == -1) {
-      // Interrupted by Ctrl+C: discard the line and let main() redraw.
-      disable_raw_mode(orig_termios);
-      std::cout << "^C\r\n";
-      got_sigint = true;
+    int rr = read_byte(c, redraw_line);
+    if (rr == -1 || (rr == 1 && c == 3)) {  // SIGINT or Ctrl+C
+      finish("^C\r\n");
       return "";
     }
-    if (rr == 0) {
-      // EOF (Ctrl+D): only exit if the line is empty, like canonical shells.
+    // EOF or Ctrl+D: exit on an empty line, otherwise do nothing (bash
+    // behavior).
+    if (rr == 0 || c == 4) {
       if (line.empty()) {
-        disable_raw_mode(orig_termios);
         shell_exit_requested = true;
-        std::cout << "exit" << std::endl;
+        finish("exit\r\n");
         return "";
       }
-      break;  // Treat as end of line.
+      if (rr == 0) break;  // Input is gone: run what we have.
+      continue;
     }
 
     if (c == '\n' || c == '\r') break;
 
     if (c == '\t') {
-      if (cursor_pos == 0 && line.empty()) {
-        // Nothing to complete on an empty line.
-        continue;
-      }
+      if (line.empty()) continue;  // Nothing to complete.
       const bool repeat_tab = last_key_was_tab;
       last_key_was_tab = true;
-      size_t safe_cursor = cursor_pos;
-      std::vector<std::string> matches =
-          handle_autocomplete(line, safe_cursor);
-      cursor_pos = safe_cursor;
+      std::vector<std::string> matches = handle_autocomplete(line, cursor_pos);
       if (matches.size() > 1 && repeat_tab) {
         // Second consecutive Tab: show the possibilities.
         std::cout << "\r\n";
@@ -199,100 +208,78 @@ std::string read_command_line() {
 
     last_key_was_tab = false;
 
-    if (c == 127) {  // Backspace
-      if (cursor_pos > 0) {
-        // Erase one full UTF-8 character, not one byte.
-        size_t start = cursor_pos - 1;
-        while (start > 0 && is_utf8_continuation((unsigned char)line[start])) {
-          start--;
-        }
-        line.erase(start, cursor_pos - start);
-        cursor_pos = start;
-      }
-      history_index = history.size();
-      current_buffer = line;
-    } else if (c == 3) {  // Ctrl+C
-      if (foreground_job.pgid != 0) {
-        // Forward the interrupt to the whole foreground process group.
-        killpg(foreground_job.pgid, SIGINT);
-      } else {
-        // Discard the line; read_byte()'s interrupt path handles it, but
-        // the raw byte can also arrive buffered.
-        disable_raw_mode(orig_termios);
-        std::cout << "^C\r\n";
-        got_sigint = true;
-        return "";
-      }
-    } else if (c == 26) {  // Ctrl+Z
-      if (foreground_job.pgid != 0) {
-        killpg(foreground_job.pgid, SIGTSTP);
-      }
-      // No foreground job: ignore (the shell itself ignores SIGTSTP).
-    } else if (c == 4) {  // Ctrl+D
-      if (line.empty()) {
-        disable_raw_mode(orig_termios);
-        std::cout << "exit" << std::endl;
-        shell_exit_requested = true;
-        return "";
-      }
-      // Non-empty line: EOF does nothing (bash behavior).
+    if (c == 127 || c == 8) {  // Backspace
+      size_t start = prev_char(cursor_pos);
+      line.erase(start, cursor_pos - start);
+      cursor_pos = start;
+      edited();
+    } else if (c == 21) {  // Ctrl+U: erase to start of line
+      line.erase(0, cursor_pos);
+      cursor_pos = 0;
+      edited();
+    } else if (c == 1) {  // Ctrl+A
+      cursor_pos = 0;
+    } else if (c == 5) {  // Ctrl+E
+      cursor_pos = line.size();
     } else if (c == 12) {  // Ctrl+L (clear screen)
-      std::cout << "\x1b[H\x1b[2J\x1b[3J" << std::flush;
-      redraw_line();
+      std::cout << "\x1b[H\x1b[2J\x1b[3J";
     } else if (c == '\x1b') {
-      char seq[2];
-      if (!read_byte(seq[0])) continue;
-      if (!read_byte(seq[1])) continue;
+      // Escape sequence: CSI is "ESC [ params final", SS3 is "ESC O final".
+      // Reading to the final byte keeps unhandled keys (F-keys, Ctrl+arrow)
+      // from leaking their tail into the line as text.
+      std::string params;
+      char final_byte = 0;
+      char b;
+      if (read_byte(b, redraw_line) != 1) continue;
+      if (b == '[') {
+        while (read_byte(b, redraw_line) == 1) {
+          if (b >= 0x40 && b <= 0x7E) {
+            final_byte = b;
+            break;
+          }
+          params += b;
+        }
+      } else if (b == 'O') {
+        if (read_byte(b, redraw_line) == 1) final_byte = b;
+      }
 
-      if (seq[0] == '[') {
-        if (seq[1] == 'D') {  // Left
-          if (cursor_pos > 0) {
-            cursor_pos--;
-            while (cursor_pos > 0 &&
-                   is_utf8_continuation((unsigned char)line[cursor_pos])) {
-              cursor_pos--;
-            }
-          }
-        } else if (seq[1] == 'C') {  // Right
-          if (cursor_pos < line.length()) {
-            cursor_pos++;
-            while (cursor_pos < line.length() &&
-                   is_utf8_continuation((unsigned char)line[cursor_pos])) {
-              cursor_pos++;
-            }
-          }
-        } else if (seq[1] == 'A') {  // Up
-          if (history_index > 0) {
-            if (history_index == history.size()) {
-              current_buffer = line;
-            }
-            history_index--;
-            line = history[history_index];
-            cursor_pos = line.length();
-          }
-        } else if (seq[1] == 'B') {  // Down
+      if (final_byte == '~') {
+        if (params == "3") {  // Delete
+          line.erase(cursor_pos, next_char(cursor_pos) - cursor_pos);
+          edited();
+        } else if (params == "1" || params == "7") {  // Home
+          cursor_pos = 0;
+        } else if (params == "4" || params == "8") {  // End
+          cursor_pos = line.size();
+        }
+      } else if (params.empty()) {
+        if (final_byte == 'D') {  // Left
+          cursor_pos = prev_char(cursor_pos);
+        } else if (final_byte == 'C') {  // Right
+          cursor_pos = next_char(cursor_pos);
+        } else if (final_byte == 'A') {  // Up
+          if (history_index > 0) recall_history(history_index - 1);
+        } else if (final_byte == 'B') {  // Down
           if (history_index < history.size()) {
-            history_index++;
-            if (history_index == history.size()) {
-              line = current_buffer;
-            } else {
-              line = history[history_index];
-            }
-            cursor_pos = line.length();
+            recall_history(history_index + 1);
           }
+        } else if (final_byte == 'H') {  // Home
+          cursor_pos = 0;
+        } else if (final_byte == 'F') {  // End
+          cursor_pos = line.size();
         }
       }
-    } else {  // Regular character
+    } else if ((unsigned char)c >= 32) {  // Regular character
       line.insert(cursor_pos, 1, c);
       cursor_pos++;
-      history_index = history.size();
-      current_buffer = line;
+      edited();
     }
+    // Any other control character (including Ctrl+Z, which the shell
+    // itself ignores) is dropped.
 
     redraw_line();
   }
 
-  disable_raw_mode(orig_termios);
-  std::cout << "\r\n";
+  finish("\r\n");
   return line;
 }

@@ -4,7 +4,6 @@
 
 #include <iostream>
 
-#include "autocomplete.h"
 #include "executor.h"
 #include "history.h"
 #include "line_editor.h"
@@ -21,42 +20,29 @@ int main() {
     return 1;
   }
 
-  // Ignore job-control signals in the shell process itself.
-  signal(SIGTTIN, SIG_IGN);
-  signal(SIGTTOU, SIG_IGN);
-  signal(SIGTSTP, SIG_IGN);
-  signal(SIGQUIT, SIG_IGN);
+  shell_interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
 
-  pid_t shell_pid = getpid();
-  if (setpgid(shell_pid, shell_pid) < 0) {
-    // Failing is fine when we are already a group leader (e.g. launched by a
-    // script); don't abort the shell for it.
-    if (errno != EPERM && errno != EACCES) {
-      perror("Couldn't put the shell in its own process group");
-      return 1;
-    }
-  }
-  shell_pgid = getpgrp();
+  // Job control is for interactive use only. Reading a script, the shell
+  // stays in its parent's process group with default signal handling, so
+  // Ctrl+C interrupts it and its children like any other program.
+  if (shell_interactive) {
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
 
-  if (tcsetpgrp(STDIN_FILENO, shell_pgid) != 0) {
-    // Non-interactive or already-foreground launches can fail here; the
-    // shell still works for batch input.
+    setpgid(0, 0);  // Fails harmlessly if we already lead a group.
+    shell_pgid = getpgrp();
+    tcsetpgrp(STDIN_FILENO, shell_pgid);
   }
 
-  setup_signal_handlers();
-
-  initialize_command_cache();
+  setup_signal_handlers(shell_interactive);
   initialize_history();
 
   while (!shell_exit_requested) {
+    // Empty on a blank line, Ctrl+C, or end of input (which also requests
+    // exit).
     std::string input_line = read_command_line();
-    if (shell_exit_requested) break;
-
-    if (got_sigint) {
-      got_sigint = false;
-      continue;  // Discard the line and redraw a fresh prompt.
-    }
-
     if (input_line.empty()) continue;
 
     add_to_history(input_line);
@@ -68,11 +54,11 @@ int main() {
     }
 
     reap_finished_children();  // Fresh job table before running.
-    execute(parsed.commands);
+    execute(parsed.pipelines);
     reap_finished_children();
   }
 
   terminate_background_jobs();
   save_history_on_exit();
-  return 0;
+  return shell_exit_status;
 }
